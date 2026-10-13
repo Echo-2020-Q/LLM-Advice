@@ -16,6 +16,7 @@ dist/
 htmlcov/
 
 # Local credentials and tool settings
+/API/
 .env
 .env.*
 *.env
