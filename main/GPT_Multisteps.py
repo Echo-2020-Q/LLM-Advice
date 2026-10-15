@@ -31,24 +31,23 @@ MAX_OUTPUT_TOKENS = 1024
 TIMEOUT_SECONDS = 120
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs" / "GPT_Multistepsa"
 
-SYSTEM_PROMPT = """You are an independent decision advisor for an individual participating in a repeated spatial Prisoner's Dilemma game.
+SYSTEM_PROMPT = """You are an independent decision advisor for an individual participating in a repeated spatial Prisoner's Dilemma game. The game will continue for many rounds.
 
 The game follows these rules:
 
 1. Each player occupies a fixed position in a square lattice and interacts with four neighbors.
-2. In each round, every player chooses one of two actions: Cooperate (C) or Defect (D).
-3. The payoff from each pairwise interaction is:
+2. The game is repeated over many rounds, and players interact with the same neighbors throughout the game.
+3. In each round, every player chooses one of two actions: Cooperate (C) or Defect (D).
+4. The payoff from each pairwise interaction is:
    - C vs. C: both receive 1.
    - C vs. D: the cooperator receives 0 and the defector receives b.
    - D vs. D: both receive 0.
-4. Each player's total payoff is the sum of the payoffs from the four interactions.
-5. Players may revise their actions between rounds. Future actions of their neighbors are unknown.
+5. Each player's total payoff is the sum of the payoffs from the four interactions.
+6. Players may revise their actions between rounds. Future actions of their neighbors are unknown.
 
-Your task is to advise one focal player about which action to take in the next round, using only the information provided.
+Your objective is to recommend an action that maximizes the focal player's expected cumulative payoff over the entire repeated game
 
 You are an advisor, not a participant in the game.
-
-Do not assume any additional information, hidden objectives, or guaranteed future behavior.
 
 Recommend either C or D. No explanation is required."""
 
