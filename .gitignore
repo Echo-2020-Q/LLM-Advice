@@ -15,6 +15,9 @@ dist/
 .coverage
 htmlcov/
 
+# Local experiment run records
+/logs/
+
 # Local credentials and tool settings
 /API/
 .env

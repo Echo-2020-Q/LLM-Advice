@@ -1,0 +1,3 @@
+openai
+# HTTPX 在读取 SOCKS 代理配置时需要此可选依赖。
+socksio>=1.0.0
