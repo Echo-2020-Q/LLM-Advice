@@ -116,6 +116,8 @@ class UpdateAndAdviceTests(unittest.TestCase):
             self.assertEqual(context.payoff, 4.0)
             self.assertEqual(context.cooperating_neighbors, 4)
             self.assertEqual(context.defecting_neighbors, 0)
+            self.assertEqual(context.grid_rows, ("CCC", "CCC", "CCC"))
+            self.assertEqual(context.grid_key, "CCCCCCCCC")
             self.assertIsInstance(context.neighbors, tuple)
             self.assertEqual(context.b, 1.5)
             self.assertEqual(context.k, 0.1)
@@ -134,6 +136,8 @@ class UpdateAndAdviceTests(unittest.TestCase):
         self.assertEqual(second.advice_requests, 9)
         self.assertEqual(second.advice_used, 9)
         self.assertEqual(second.strategy_changes, 0)
+        self.assertTrue(all(context.grid_rows == ("DDD", "DDD", "DDD") for context in observations[9:]))
+        self.assertTrue(all(context.grid_rows == ("CCC", "CCC", "CCC") for context in observations[:9]))
 
     def test_asynchronous_selection_has_replacement_and_immediate_changes(self):
         expected_grid = [["C"] * 3 for _ in range(3)]
@@ -143,6 +147,12 @@ class UpdateAndAdviceTests(unittest.TestCase):
             row, col = context.position
             visited.append(context.position)
             self.assertEqual(context.strategy, expected_grid[row][col])
+            expected_window = tuple(
+                "".join(expected_grid[r % 3][c % 3] for c in range(col - 1, col + 2))
+                for r in range(row - 1, row + 2)
+            )
+            self.assertEqual(context.grid_rows, expected_window)
+            self.assertEqual(context.grid_key, "".join(expected_window))
             expected_cooperators = sum(
                 expected_grid[n.position[0]][n.position[1]] == "C"
                 for n in context.neighbors
@@ -235,6 +245,239 @@ class UpdateAndAdviceTests(unittest.TestCase):
         self.assertIs(raised.exception, expected_error)
 
 
+class LocalGridObservationTests(unittest.TestCase):
+    def capture_contexts(self, grid, boundary="periodic"):
+        observations = {}
+
+        def advisor(context):
+            observations[context.position] = context
+            return context.strategy
+
+        model = SpatialPrisonersDilemma(
+            SimulationConfig(size=len(grid), lambda_prob=1, update_mode="synchronous", boundary=boundary),
+            advisor=advisor, initial_grid=grid,
+        )
+        model.step()
+        return model, observations
+
+    def test_periodic_corner_windows_keep_north_south_and_west_east_orientation(self):
+        model, contexts = self.capture_contexts(("CDCD", "DCCD", "CDCC", "DDCC"))
+        expected = {
+            (0, 0): ("CDD", "DCD", "DDC"),
+            (0, 3): ("CCD", "CDC", "CDD"),
+            (3, 0): ("CCD", "CDD", "DCD"),
+            (3, 3): ("CCC", "CCD", "CDC"),
+        }
+        for position, rows in expected.items():
+            with self.subTest(position=position):
+                context = contexts[position]
+                self.assertEqual(context.grid_rows, rows)
+                self.assertEqual(context.grid_key, "".join(rows))
+                self.assertEqual(context.grid_rows[1][1], context.strategy)
+                self.assertEqual(len(context.neighbors), 4)
+                self.assertEqual(len(model.neighbors(*position)), 4)
+                self.assertEqual(
+                    tuple(neighbor.strategy for neighbor in context.neighbors),
+                    (rows[0][1], rows[2][1], rows[1][0], rows[1][2]),
+                )
+
+    def test_same_four_neighbors_and_payoff_can_have_distinct_diagonal_keys(self):
+        first_grid = ("CDC", "DCC", "CDC")
+        second_grid = ("DDC", "DCC", "CDC")
+        first_model, first_contexts = self.capture_contexts(first_grid)
+        second_model, second_contexts = self.capture_contexts(second_grid)
+        first, second = first_contexts[(1, 1)], second_contexts[(1, 1)]
+        self.assertEqual(first.grid_rows, first_grid)
+        self.assertEqual(second.grid_rows, second_grid)
+        self.assertEqual(first.grid_key, "CDCDCCCDC")
+        self.assertEqual(second.grid_key, "DDCDCCCDC")
+        self.assertNotEqual(first.grid_key, second.grid_key)
+        self.assertEqual(first.strategy, "C")
+        self.assertEqual(second.strategy, first.strategy)
+        self.assertEqual(first.cooperating_neighbors, 1)
+        self.assertEqual(second.cooperating_neighbors, 1)
+        self.assertEqual(first.defecting_neighbors, 3)
+        self.assertEqual(second.defecting_neighbors, 3)
+        self.assertEqual(first.payoff, 1.0)
+        self.assertEqual(second.payoff, 1.0)
+        self.assertEqual(first_model.payoff(1, 1), second_model.payoff(1, 1))
+
+    def test_open_boundary_omits_incomplete_windows_without_inventing_cells(self):
+        _, contexts = self.capture_contexts(("CDCD", "DCCD", "CDCC", "DDCC"), boundary="open")
+        for (row, col), context in contexts.items():
+            with self.subTest(position=(row, col)):
+                if row in (0, 3) or col in (0, 3):
+                    self.assertIsNone(context.grid_rows)
+                    self.assertIsNone(context.grid_key)
+                else:
+                    self.assertIsInstance(context.grid_rows, tuple)
+                    self.assertEqual(len(context.grid_rows), 3)
+                    self.assertTrue(all(len(line) == 3 for line in context.grid_rows))
+                    self.assertEqual(context.grid_rows[1][1], context.strategy)
+        self.assertEqual(contexts[(1, 1)].grid_rows, ("CDC", "DCC", "CDC"))
+        self.assertEqual(contexts[(2, 2)].grid_rows, ("CCD", "DCC", "DCC"))
+
+
+class FixedAdviceAccessTests(unittest.TestCase):
+    def test_access_count_uses_decimal_floor_and_mask_is_immutable(self):
+        cases = ((10, 0.29, 29), (3, 0.29, 2), (3, 0.1, 0), (3, 0.999, 8),
+                 (3, 0.0, 0), (3, 1.0, 9))
+        for size, fraction, expected_count in cases:
+            with self.subTest(size=size, fraction=fraction):
+                config = SimulationConfig(size=size, llm_access_fraction=fraction)
+                self.assertEqual(config.llm_access_count, expected_count)
+                model = SpatialPrisonersDilemma(config)
+                mask = model.llm_access_grid
+                self.assertIsInstance(mask, tuple)
+                self.assertTrue(all(isinstance(row, tuple) for row in mask))
+                self.assertTrue(all(type(value) is bool for row in mask for value in row))
+                self.assertEqual(len(mask), size)
+                self.assertTrue(all(len(row) == size for row in mask))
+                self.assertEqual(sum(sum(row) for row in mask), expected_count)
+                with self.assertRaises(TypeError):
+                    mask[0][0] = not mask[0][0]
+
+    def test_zero_access_never_calls_advisor_and_matches_pure_fermi(self):
+        def forbidden_advisor(context):
+            raise AssertionError("P=0 时不能请求建议，即使 lambda=1")
+
+        for mode in ("synchronous", "asynchronous"):
+            with self.subTest(mode=mode):
+                common = dict(size=4, seed=23, b=1.1, k=0.5, update_mode=mode)
+                baseline = SpatialPrisonersDilemma(SimulationConfig(lambda_prob=0, **common))
+                no_access = SpatialPrisonersDilemma(
+                    SimulationConfig(lambda_prob=1, llm_access_fraction=0, **common),
+                    advisor=forbidden_advisor,
+                )
+                self.assertEqual(no_access.grid, baseline.grid)
+                self.assertEqual(no_access.run(8), baseline.run(8))
+                self.assertEqual(no_access.grid, baseline.grid)
+
+    def test_full_access_preserves_pre_access_rule_trajectories(self):
+        # 加入资格门控之前保存的轨迹，用于防止新增抽样消耗已有的随机数流。
+        expected = {
+            "synchronous": (
+                [(0.625, 0, 0, 0, 0), (0.4375, 7, 7, 9, 7), (0.4375, 7, 7, 9, 10),
+                 (0.3125, 6, 6, 10, 8), (0.25, 8, 8, 8, 9)],
+                ["DCDD", "DDDC", "DDDC", "CDDD"],
+            ),
+            "asynchronous": (
+                [(0.625, 0, 0, 0, 0), (0.5, 7, 7, 9, 8), (0.375, 7, 7, 9, 10),
+                 (0.1875, 6, 6, 10, 7), (0.375, 8, 8, 8, 9)],
+                ["DCCD", "DDDC", "DDDD", "CDCC"],
+            ),
+        }
+        for mode in expected:
+            for explicit_fraction in ({}, {"llm_access_fraction": 1.0}):
+                with self.subTest(mode=mode, explicit_fraction=explicit_fraction):
+                    config = SimulationConfig(
+                        size=4, b=1.1, k=0.5, lambda_prob=0.4, seed=23,
+                        update_mode=mode, **explicit_fraction,
+                    )
+                    model = SpatialPrisonersDilemma(
+                        config, advisor=lambda context: "D" if context.strategy == "C" else "C",
+                    )
+                    actual = [
+                        (row.cooperation_rate, row.advice_requests, row.advice_used,
+                         row.fermi_updates, row.strategy_changes)
+                        for row in model.run(4)
+                    ]
+                    self.assertEqual(actual, expected[mode][0])
+                    self.assertEqual(["".join(row) for row in model.grid], expected[mode][1])
+
+    def test_synchronous_partial_access_requests_same_people_each_round(self):
+        observed = []
+
+        def advisor(context):
+            observed.append(context.position)
+            return "D" if context.strategy == "C" else "C"
+
+        model = SpatialPrisonersDilemma(
+            SimulationConfig(size=3, lambda_prob=1, llm_access_fraction=0.5,
+                             update_mode="synchronous", seed=42),
+            advisor=advisor,
+        )
+        original_mask = model.llm_access_grid
+        eligible_positions = {
+            (row, col) for row in range(3) for col in range(3) if original_mask[row][col]
+        }
+        self.assertEqual(len(eligible_positions), 4)
+        for _ in range(4):
+            observed.clear()
+            stats = model.step()
+            self.assertEqual(set(observed), eligible_positions)
+            self.assertEqual(len(observed), 4)
+            self.assertEqual(stats.advice_requests, 4)
+            self.assertEqual(stats.advice_used, 4)
+            self.assertEqual(stats.fermi_updates, 5)
+            self.assertEqual(model.llm_access_grid, original_mask)
+
+    def test_asynchronous_advice_only_reaches_eligible_positions(self):
+        observed = []
+
+        def advisor(context):
+            observed.append(context.position)
+            return "D" if context.strategy == "C" else "C"
+
+        model = SpatialPrisonersDilemma(
+            SimulationConfig(size=4, lambda_prob=1, llm_access_fraction=0.4,
+                             update_mode="asynchronous", seed=42),
+            advisor=advisor,
+        )
+        original_mask = model.llm_access_grid
+        total_requests = 0
+        for _ in range(4):
+            observed.clear()
+            stats = model.step()
+            self.assertTrue(all(original_mask[row][col] for row, col in observed))
+            self.assertEqual(stats.advice_requests, len(observed))
+            self.assertEqual(stats.advice_used, len(observed))
+            self.assertEqual(stats.fermi_updates, 16 - len(observed))
+            self.assertEqual(model.llm_access_grid, original_mask)
+            total_requests += len(observed)
+        self.assertGreater(total_requests, 0)
+
+    def test_access_is_reproducible_without_changing_initial_state_or_none_fallback(self):
+        for mode in ("synchronous", "asynchronous"):
+            common = dict(size=5, seed=23, b=1.1, k=0.5, update_mode=mode)
+            baseline = SpatialPrisonersDilemma(SimulationConfig(lambda_prob=0, **common))
+            initial = baseline.grid
+            reference = baseline.run(6)
+            for fraction in (0.0, 0.25, 0.75, 1.0):
+                with self.subTest(mode=mode, fraction=fraction):
+                    config = SimulationConfig(lambda_prob=0.6, llm_access_fraction=fraction, **common)
+                    first = SpatialPrisonersDilemma(config, advisor=lambda context: None)
+                    repeat = SpatialPrisonersDilemma(config, advisor=lambda context: None)
+                    self.assertEqual(first.llm_access_grid, repeat.llm_access_grid)
+                    self.assertEqual(first.grid, initial)
+                    self.assertEqual(repeat.grid, initial)
+                    history = first.run(6)
+                    self.assertEqual(history, repeat.run(6))
+                    self.assertEqual(first.grid, baseline.grid)
+                    for actual, expected in zip(history, reference):
+                        for field in ("round", "cooperation_rate", "average_payoff",
+                                      "advice_used", "fermi_updates", "strategy_changes"):
+                            self.assertEqual(getattr(actual, field), getattr(expected, field))
+
+    def test_people_without_access_can_imitate_eligible_neighbors(self):
+        model = SpatialPrisonersDilemma(
+            SimulationConfig(size=3, b=1.1, k=1, lambda_prob=1, initial_cooperation=0,
+                             llm_access_fraction=0.12, seed=42, update_mode="synchronous"),
+            advisor=lambda context: "C",
+        )
+        self.assertEqual(model.config.llm_access_count, 1)
+        model.step()
+        # 初次同步更新的旧网格全为 D，只有有资格者能直接从建议获得 C。
+        for row in range(3):
+            for col in range(3):
+                self.assertEqual(model.grid[row][col], "C" if model.llm_access_grid[row][col] else "D")
+        model.run(2)
+        self.assertTrue(any(
+            model.grid[row][col] == "C" and not model.llm_access_grid[row][col]
+            for row in range(3) for col in range(3)
+        ))
+
+
 class ConfigurationAndHistoryTests(unittest.TestCase):
     def test_invalid_configuration_is_rejected(self):
         invalid = {
@@ -243,6 +486,7 @@ class ConfigurationAndHistoryTests(unittest.TestCase):
             "k": (0, -0.1, math.nan, math.inf),
             "lambda_prob": (-0.1, 1.1, math.nan, math.inf),
             "initial_cooperation": (-0.1, 1.1, math.nan, math.inf),
+            "llm_access_fraction": (-0.1, 1.1, math.nan, math.inf, -math.inf),
             "boundary": ("closed",),
             "update_mode": ("random",),
         }

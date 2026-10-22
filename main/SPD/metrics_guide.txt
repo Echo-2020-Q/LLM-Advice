@@ -1,0 +1,97 @@
+空间囚徒困境：资格组收益与纯 Fermi 配对对照
+
+运行设置（直接修改 run_experiment.py）
+  PAIRED_FERMI_CONTROL = True：每次实验另运行一条纯 Fermi 对照轨迹。
+  INITIAL_COOPERATION = 0.5：各位置以 50% 概率初始化为 C。
+  P = 0.2 / SCAN_P_VALUES = [P]：固定选定 20% 位置具有建议资格。
+  SCAN_LAMBDA_VALUES = [0, 0.1, 0.5, 1]：扫描固定采纳概率。
+  REPEATS：每组参数的独立重复次数；不同重复使用不同种子。
+  EARLY_AVERAGE_STEPS / TAIL_AVERAGE_STEPS：前期、末期窗口长度。
+  这些实验的 λ 保持固定，本次尚未实现个体按收益自适应调整 λ。
+
+LLM 策略表与观察窗口
+  LLM_BATCH_DIR 指向本地批次，按 config.json 的 observation_format 自动识别输入格式。
+  当前默认批次是 20261016_173605_322949_5d224b193871427f8c133150d99a6599。
+  grid_3x3：512种完整3×3布局。按北到南、西到东逐行拼接为9字符 grid_key，
+  中心（第5个字符）是本人，四个角提供额外观察；不合并旋转、镜像或相同邻居计数。
+  同步更新从该轮共同旧状态取窗；异步更新从当前事件前的状态取窗。
+  周期边界在全局格子空间取模，不在截取出来的3×3窗口内部再次环绕。
+  收益计算和Fermi模仿仍仅使用上下左右四邻居，四个角不直接贡献本人收益。
+  neighbor_counts 或未标注格式的旧批次：按自身C/D和四邻居C/D数量匹配10种局面。
+  两种表都从对应局面的历史回答中有放回抽样；不比较实验b与源批次b。
+  当前3×3批次每种局面有2条回答，抽样只复用这些回答，不产生新的LLM回答。
+  源提示词描述同步更新；将该表用于异步实验时，是对同一策略表的跨更新方式复用。
+  两种本地表目前都要求周期边界；缺失局面或失败回答会在运行前报错。
+
+配对方式
+  每个参数组合、每个重复均有自己的对照；仅将对照 λ 改为 0。
+  b、K、更新方式、边界、种子、初始策略网格、固定资格位置和总步数都相同。
+  资格组在对照中仍表示同一批位置，但这些位置完全执行 Fermi 更新。
+  两条轨迹各自持有随机数状态。干预后随机数消费顺序可能不同，
+  因此这不保证逐事件抽到同一个个体/邻居；基线保持原有纯 Fermi 动力学。
+
+收益口径
+  每个完整时间步结束后，对所有位置测量一次当前空间收益。
+  累计使用 round=1..T；round=0 只展示初态，不累计。
+  异步模式也只在一个完整 Monte Carlo 步结束后观测，不按个体被抽中次数加权。
+  这是一致时间尺度下的轮末收益快照累计，不是更新事件的实际到账收益。
+  累计统计不会参与 Fermi 规则；Fermi 始终使用原来的当前邻居收益。
+  按资格分组，不按当轮是否实际咨询分组，也不按个体当前是 C/D 分组。
+
+文件
+  扫描根目录 summary.csv：每行是一组参数的一次重复，包含两条轨迹的汇总与差值。
+  扫描根目录 scan_config.json：设置、建议来源和 statistics_semantics 指标说明。
+  每个子目录 history.csv：原逐轮指标 + 分组收益 + 对照 + 差值，按 round 对齐。
+  每个子目录 final_grid.csv：建议实验的最终网格。
+  精简模式不额外生成对照子目录。单组模式的汇总在 config.json 的 summary 内。
+
+字段命名
+  population：全体；eligible：有资格组；ineligible：无资格组。
+  无前缀：建议实验的指标；control_：纯 Fermi 对照的指标。
+  delta_：建议实验减去同位置分组的纯 Fermi 对照；正数表示实验值更大。
+  例如 delta_eligible_cumulative_mean_payoff 是资格组的人均累计收益配对优势。
+
+history.csv 的新增收益字段（把 g 换成上面的任一组名）
+  g_mean_payoff：该轮组内人均收益。
+  g_cumulative_mean_payoff：截至该轮，组内每人累计收益的平均值。
+  每项还有 control_ 和 delta_ 版本；同一行严格对应同一个完整步。
+
+summary.csv 的收益字段
+  g_count：该组人数。
+  g_cumulative_total_payoff：该组所有位置、所有观测步的收益总和。
+  g_cumulative_mean_payoff：累计总收益 / 该组人数，适合比较不同大小的人群。
+  g_time_mean_payoff：人均累计收益 / 实际更新步数，即全程每人每步平均收益。
+  g_early_mean_payoff：最初窗口内每人每步平均收益。
+  g_tail_mean_payoff：最后窗口内每人每步平均收益。
+  control_ 包含上述所有指标；delta_ 提供人均累计、全程/前期/末期均值的配对差值。
+  time_mean_cooperation_rate：round1..T 的平均合作率，另有 control_、delta_。
+  原有 final_* / tail_mean_* 结果保留，并提供相应 control_、delta_。
+
+窗口与空值
+  observed_steps / early_observed_steps / tail_observed_steps 是实际样本步数。
+  early_start_round / early_end_round 是实际前期窗口起止步。
+  payoff_tail_start_round / payoff_tail_end_round 是实际末期收益窗口起止步。
+  payoff_windows_overlap=True 表示两窗口重叠，不能把相同区间视作独立的早晚证据。
+  P=0 或 P=1 时有一个空组：累计总收益为0，人均指标与差值为空。
+  STEPS=0 时非空组累计为0，各时间收益均值为空；原有最终状态指标仍展示初态。
+  未发生的事件时间、未启用的对照列也为空。CSV空白对应JSON null，不代表数值0。
+
+全 D 与合作恢复（每条轨迹分别记录，无前缀/control_）
+  first_extinction_round：首次观测到全 D 的轮次；初态全 D 记0，未出现则为空。
+  extinction_observed：观察期内是否至少出现一次全 D。
+  extinction_events：进入全 D 的次数，包含初态全 D。
+  cooperation_revivals：从全 D 恢复到至少一个 C 的次数。
+  extinct_at_end：观察终点是否全 D。
+  final_extinction_start_round：仅终点全 D 时，最后连续全 D 区间的起点。
+  上述指标只按初态与完整步末观测，不捕捉异步步内的短暂状态。
+  LLM 建议可能重新引入 C；首次全 D 不等于永久灭绝。
+
+判断建议对谁有利
+  优先查看 delta_eligible_cumulative_mean_payoff 和 delta_population_cumulative_mean_payoff。
+  前者为正、后者为负：这次配对实验中资格组平均获益，而全体平均受损。
+  再看 delta_ineligible_cumulative_mean_payoff，量化无资格组的变化。
+  用 delta_eligible_early_mean_payoff 与 delta_eligible_tail_mean_payoff 判断优势是否延续，
+  并结合 history.csv 的逐轮曲线，而不只查看最后一步。
+  差值包含邻域传播效应，不能解释为一次咨询的纯直接效应。
+  多次重复时先计算每个种子的配对差值，再按参数组合比较均值和离散程度。
+  格点、时间步、不同 λ 重用的同一条 Fermi 基线不作为额外独立重复。

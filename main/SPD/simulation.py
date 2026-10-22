@@ -1,9 +1,12 @@
-"""仅依赖 Python 标准库的空间弱囚徒困境仿真（Python >= 3.10）。
+"""仅依赖 Python 标准库的空间弱囚徒困境仿真（Python >= 3.9）。
 
 收益矩阵（行为自身策略、列为邻居策略，顺序 C、D）：[[1, 0], [b, 0]]。
 个体不与自己博弈；收益取所有冯诺依曼邻居的收益之和。
-每次策略更新以概率 lambda_prob 请求并直接采用建议，否则执行 Fermi 模仿。
-建议为 None 时也执行 Fermi；lambda_prob 是每次更新的概率，不是固定个体比例。
+初始化时随机选定 floor(llm_access_fraction * L²) 人拥有建议资格，之后不再重选。
+有资格者每次更新以概率 lambda_prob 请求并直接采用建议，否则执行 Fermi 模仿。
+无资格者始终执行 Fermi，仍可模仿有资格邻居；建议为 None 时也回退 Fermi。
+资格比例和每次咨询概率是两个独立参数，不能用两者的乘积代替固定资格人群。
+建议上下文另提供以个体为中心的 3×3 策略窗口，收益和 Fermi 模仿仍仅使用四邻居。
 
 随机异步：一个 Monte Carlo 步包含 L*L 次有放回抽样，即时修改策略和重算收益。
 同步：每人根据同一旧状态更新一次，最后统一替换；一轮记为一个时间步。
@@ -12,7 +15,8 @@
 import math
 import random
 from dataclasses import dataclass
-from typing import Sequence
+from decimal import Decimal
+from typing import Optional, Sequence
 
 from .llm_advisor import (
     AdviceContext, Advisor, NeighborObservation, Position, Strategy, request_advice,
@@ -29,6 +33,7 @@ class SimulationConfig:
     seed: int = 42
     boundary: str = "periodic"
     update_mode: str = "asynchronous"
+    llm_access_fraction: float = 1.0
 
     def __post_init__(self):
         if type(self.size) is not int or self.size < 3:
@@ -37,7 +42,7 @@ class SimulationConfig:
             raise ValueError("b 必须大于 1，且最大个体收益 4*b 必须有限。")
         if not math.isfinite(self.k) or self.k <= 0:
             raise ValueError("k 必须是有限正数。")
-        for name in ("lambda_prob", "initial_cooperation"):
+        for name in ("lambda_prob", "initial_cooperation", "llm_access_fraction"):
             value = getattr(self, name)
             if not math.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f"{name} 必须在 [0, 1] 内。")
@@ -47,6 +52,11 @@ class SimulationConfig:
             raise ValueError("boundary 必须为 periodic 或 open。")
         if self.update_mode not in {"asynchronous", "synchronous"}:
             raise ValueError("update_mode 必须为 asynchronous 或 synchronous。")
+
+    @property
+    def llm_access_count(self) -> int:
+        """固定资格人数向下取整；按十进制计算，避免 0.29 × 100 被误取为 28。"""
+        return int(Decimal(str(float(self.llm_access_fraction))) * self.size ** 2)
 
 
 @dataclass(frozen=True)
@@ -79,7 +89,7 @@ class SpatialPrisonersDilemma:
         self,
         config: SimulationConfig,
         advisor: Advisor = request_advice,
-        initial_grid: Sequence[Sequence[Strategy]] | None = None,
+        initial_grid: Optional[Sequence[Sequence[Strategy]]] = None,
     ):
         self.config = config
         self.advisor = advisor
@@ -88,6 +98,13 @@ class SpatialPrisonersDilemma:
         self._rng = random.Random(config.seed)
         # 单独的建议触发随机流，使空接口不会改变同种子的纯 Fermi 演化轨迹。
         self._advice_rng = random.Random(f"advice:{config.seed}")
+        # 资格仅在初始化时抽取；独立随机流不改变初始策略或既有 Fermi/咨询轨迹。
+        access_indices = list(range(self._population))
+        random.Random(f"llm-access:{config.seed}").shuffle(access_indices)
+        access_mask = [False] * self._population
+        for index in access_indices[:config.llm_access_count]:
+            access_mask[index] = True
+        self._llm_access = tuple(access_mask)
         self._neighbors = tuple(self._build_neighbors(i) for i in range(self._population))
         if initial_grid is None:
             self._strategies: list[Strategy] = [
@@ -122,6 +139,12 @@ class SpatialPrisonersDilemma:
         size = self.config.size
         return tuple(tuple(self._strategies[i:i + size]) for i in range(0, self._population, size))
 
+    @property
+    def llm_access_grid(self) -> tuple[tuple[bool, ...], ...]:
+        """返回固定建议资格的不可变二维布尔快照；True 表示该个体有资格。"""
+        size = self.config.size
+        return tuple(self._llm_access[i:i + size] for i in range(0, self._population, size))
+
     def neighbors(self, row: int, col: int) -> tuple[Position, ...]:
         """返回上、下、左、右邻居；开放边界省略越界方向。"""
         return tuple(divmod(i, self.config.size) for i in self._neighbors[self._index(row, col)])
@@ -134,14 +157,25 @@ class SpatialPrisonersDilemma:
         return self._payoff(self._index(row, col), self._strategies)
 
     def _context(
-        self, index: int, state: Sequence[Strategy], payoffs: list[float] | None,
+        self, index: int, state: Sequence[Strategy], payoffs: Optional[list[float]],
     ) -> AdviceContext:
         def current_payoff(i):
             return payoffs[i] if payoffs is not None else self._payoff(i, state)
 
+        size = self.config.size
+        row, col = divmod(index, size)
+        grid_rows = None
+        if self.config.boundary == "periodic" or (0 < row < size - 1 and 0 < col < size - 1):
+            # 使用传入的决策状态：同步为整轮旧状态，异步为当前事件更新前状态。
+            # 开放边界的边缘缺少完整窗口，保留 None，不补造邻居策略。
+            grid_rows = tuple(
+                "".join(state[(r % size) * size + c % size] for c in range(col - 1, col + 2))
+                for r in range(row - 1, row + 2)
+            )
+
         return AdviceContext(
             round=self.round + 1,
-            position=divmod(index, self.config.size),
+            position=(row, col),
             strategy=state[index],
             payoff=current_payoff(index),
             b=self.config.b,
@@ -150,13 +184,15 @@ class SpatialPrisonersDilemma:
                 NeighborObservation(divmod(j, self.config.size), state[j], current_payoff(j))
                 for j in self._neighbors[index]
             ),
+            grid_rows=grid_rows,
         )
 
     def _choose_strategy(
-        self, index: int, state: Sequence[Strategy], payoffs: list[float] | None,
+        self, index: int, state: Sequence[Strategy], payoffs: Optional[list[float]],
     ) -> tuple[Strategy, int, int]:
         requested = int(
-            self.config.lambda_prob > 0
+            self._llm_access[index]
+            and self.config.lambda_prob > 0
             and self._advice_rng.random() < self.config.lambda_prob
         )
         if requested:

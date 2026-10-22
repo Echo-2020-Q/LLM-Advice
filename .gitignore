@@ -18,6 +18,12 @@ htmlcov/
 # Local experiment run records
 /logs/
 
+# Generated reports kept locally for now
+/reports/
+
+# Microsoft Office temporary lock files
+~$*
+
 # Local credentials and tool settings
 /API/
 .env
