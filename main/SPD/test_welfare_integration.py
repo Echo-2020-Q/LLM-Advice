@@ -56,6 +56,9 @@ class WelfareIntegrationTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="spd_welfare_test_")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        workers = patch.object(runner, "NUM_WORKERS", 1)
+        workers.start()
+        self.addCleanup(workers.stop)
 
     def run_case(self, name, config, steps, paired=True, early=2, tail=2):
         advisor = AlternatingAdvisor()

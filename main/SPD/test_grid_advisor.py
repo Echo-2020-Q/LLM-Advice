@@ -88,7 +88,7 @@ class GridAdvisorTests(unittest.TestCase):
 
     def invoke(self, arguments):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            return runner.main(arguments)
+            return runner.main(["--workers", "1"] + arguments)
 
     def test_complete_table_preserves_512_directed_grids_and_metadata(self):
         advisor = EmpiricalAdvisor(self.batch, seed=42)

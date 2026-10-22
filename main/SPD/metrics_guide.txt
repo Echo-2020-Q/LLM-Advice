@@ -6,8 +6,24 @@
   P = 0.2 / SCAN_P_VALUES = [P]：固定选定 20% 位置具有建议资格。
   SCAN_LAMBDA_VALUES = [0, 0.1, 0.5, 1]：扫描固定采纳概率。
   REPEATS：每组参数的独立重复次数；不同重复使用不同种子。
+  NUM_WORKERS = 4：最多同时运行4次实验；设为1恢复串行，也可用 --workers 覆盖。
   EARLY_AVERAGE_STEPS / TAIL_AVERAGE_STEPS：前期、末期窗口长度。
   这些实验的 λ 保持固定，本次尚未实现个体按收益自适应调整 λ。
+
+多核运行
+  扫描和单组重复实验均可并行；实际进程数为 min(NUM_WORKERS, 总运行次数)。
+  每个任务包含一次完整实验及其启用的配对 Fermi 对照，不拆分格点更新。
+  只有一次运行时直接串行；增加进程数不会加速单条轨迹。
+  各任务使用独立的仿真与建议随机流；相同参数和种子的结果不受进程数影响。
+  使用兼容 Windows 的 spawn 启动方式，不需要安装额外库。
+  请从 IDE 直接运行本文件，或在 main/SPD 中执行 python run_experiment.py --workers 4。
+  并行数建议不超过 CPU 逻辑核心数，并为其他程序保留资源；Windows实际最多61个。
+  多进程会增加内存占用及启动开销，任务很小时不保证更快。
+  控制台由主进程报告已完成次数；并行时不打印各进程的逐步进度。
+  子目录文件仍由各自任务独立保存，summary.csv只由主进程写入并按run_id排序。
+  批次配置记录requested_workers、actual_workers、parallel_start_method和completed_run_ids。
+  失败或Ctrl+C后停止派发任务，正在运行的任务在完整步之间退出；保留已完成结果。
+  未完成子目录可能只留有部分历史，不应视为完整实验；以批次配置及summary.csv为准。
 
 LLM 策略表与观察窗口
   LLM_BATCH_DIR 指向本地批次，按 config.json 的 observation_format 自动识别输入格式。

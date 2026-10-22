@@ -9,6 +9,7 @@
 也可运行：
     python main/SPD/run_experiment.py --scan --b-values 1.5 --k-values 0.1 1 --lambda-values 0 0.2
 REPEATS 控制每组参数运行多少次，单组和扫描模式均生效，也可传入 --repeats。
+NUM_WORKERS 控制并行进程数，也可传入 --workers；1 为串行，多个独立实验可并行。
 扫描子目录默认只保存 history.csv 和 final_grid.csv；SCAN_SAVE_DETAILS=True 可恢复完整记录。
 默认配对运行同初态、同资格位置的纯 Fermi 对照，在原有 CSV 中记录分组收益和配对差值。
 单值 --b/--k/--lambda/--p/--seed 只用于单组模式；扫描模式使用对应的 --*-values。
@@ -29,6 +30,7 @@ import argparse
 import csv
 import json
 import math
+import multiprocessing
 import sys
 from collections import deque
 from dataclasses import asdict, replace
@@ -45,12 +47,19 @@ SIZE = 50
 
 # 仿真时间步数，必须为非负整数；0 表示只保存初始状态。
 # 异步模式每步随机抽取 L² 次个体（有放回）；同步模式每步所有个体更新一次。
-STEPS = 1000
+STEPS = 10000
 
 # 每组参数独立运行的次数，必须为正整数；单组模式和扫描模式都生效。
 # 例如 REPEATS=10 表示每组运行10次，每次都演化 STEPS 步。
 # 默认第 r 次使用种子 SEED+r-1（r从1开始），重新初始化策略、资格人群和建议抽样器。
-REPEATS = 10
+REPEATS = 20
+
+# 同时运行的进程数，必须为正整数；1 为串行，4 表示最多同时运行4次实验。
+# 扫描和单组重复均生效；实际进程数不超过总运行次数，只有1次实验时直接串行。
+# 每个进程负责一次完整实验及其配对 Fermi 对照，不拆分单次实验内部的格点更新。
+# 建议不超过电脑的 CPU 逻辑核心数，并为其他程序留一些资源；进程越多，占用内存越多。
+# Windows 实际进程数最多61；固定种子下，修改此参数不改变每次实验的结果。
+NUM_WORKERS = 16
 
 # 背叛诱惑收益 b，要求 b > 1；收益矩阵固定为 R=1、S=0、T=b、P=0。
 # 个体收益为与所有邻居博弈的收益之和，不是跨时间步累加。
@@ -103,6 +112,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "results"
 
 # 每隔多少个时间步打印一次进度，必须为非负整数；0 表示不打印中途进度。
 # 仅影响控制台显示，逐步统计仍全部保存到 history.csv。
+# 多进程时仅由主进程打印每次实验完成的进度，避免各进程的逐步输出混杂。
 REPORT_EVERY = 100
 
 # 是否启用参数扫描：False 只运行上方单组参数；True 遍历下面列表的所有组合。
@@ -132,7 +142,8 @@ SCAN_LAMBDA_VALUES = [0.0, 0.1, 0.5, 1.0]
 
 # 要扫描的资格比例 P，各值须在 [0, 1]；如 [0.0, 0.2, 0.5, 1.0]。
 # [P] 表示不扫描此参数，只使用上方 P；每组实验都单独选定并保存固定资格网格。
-SCAN_P_VALUES = [P]
+SCAN_P_VALUES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5,
+                 0.6, 0.7, 0.8, 0.9, 1.0]
 
 
 # 扫描种子列表的高级设置：None 表示自动使用 SEED 开始的 REPEATS 个连续整数。
@@ -144,7 +155,7 @@ SCAN_SEEDS = None
 # 汇总时取最后多少个更新步计算合作率/收益的时间平均，必须为正整数。
 # 不包含第 0 步；不足此数量时使用实际步数。STEPS=0 时仅统计第 0 步。
 # 这是有限时间的末段平均，不代表已自动判定达到稳态；单次模式也会记录此统计。
-TAIL_AVERAGE_STEPS = 100
+TAIL_AVERAGE_STEPS = 1000
 
 # 是否为每次实验配对运行纯 Fermi 对照；True 会增加一次相同步数的仿真。
 # 对照仅把 λ 设为0，保留 b、K、种子、初始网格和固定资格位置，用同一批位置比较收益。
@@ -155,7 +166,7 @@ PAIRED_FERMI_CONTROL = True
 # 末期窗口使用 TAIL_AVERAGE_STEPS；短实验两窗口可能重叠，会在汇总中标记。
 # 累计收益按每个完整时间步结束后的收益累加，第0步只展示初态、不计入累计。
 # 这些统计不改变 Fermi 使用的当前收益。空组的人均指标为空，不用0替代。
-EARLY_AVERAGE_STEPS = 100
+EARLY_AVERAGE_STEPS = 200
 # ==================== 实验参数结束 ====================
 
 
@@ -165,10 +176,12 @@ if __package__ in (None, ""):
     from SPD.llm_advisor import EmpiricalAdvisor, request_advice
     from SPD.simulation import SimulationConfig, SpatialPrisonersDilemma
     from SPD.experiment_metrics import PayoffTracker, GROUPS, HISTORY_FIELDS, SUMMARY_FIELDS
+    from SPD.parallel_execution import ParallelRunError, run_parallel
 else:
     from .llm_advisor import EmpiricalAdvisor, request_advice
     from .simulation import SimulationConfig, SpatialPrisonersDilemma
     from .experiment_metrics import PayoffTracker, GROUPS, HISTORY_FIELDS, SUMMARY_FIELDS
+    from .parallel_execution import ParallelRunError, run_parallel
 
 
 GAIN_FIELDS = tuple(
@@ -202,6 +215,8 @@ def build_parser():
     parser.add_argument("--steps", type=int, default=STEPS, help="时间步数（非负整数）")
     parser.add_argument("--repeats", type=int, default=REPEATS,
                         help="每组参数独立运行次数（正整数），单组和扫描模式均生效")
+    parser.add_argument("--workers", type=int, default=NUM_WORKERS,
+                        help="并行进程数（正整数）；1为串行，实际不超过总运行次数")
     # 单值默认延迟到构建配置时读取，以识别扫描时误传的单值参数。
     parser.add_argument("--b", type=float, default=None, help="单组模式的 T=b，默认使用代码中的 B")
     parser.add_argument("--k", type=float, default=None, help="单组模式的 K，默认使用代码中的 K")
@@ -301,6 +316,8 @@ def prepare_configs(args):
         raise ValueError("PAIRED_FERMI_CONTROL 必须为 True 或 False。")
     if type(args.repeats) is not int or args.repeats <= 0:
         raise ValueError("REPEATS / --repeats 必须为正整数。")
+    if type(args.workers) is not int or args.workers <= 0:
+        raise ValueError("NUM_WORKERS / --workers 必须为正整数。")
     if type(args.scan) is not bool:
         raise ValueError("SCAN_ENABLED 必须为 True 或 False。")
     if type(args.scan_save_details) is not bool:
@@ -392,8 +409,13 @@ def welfare_summary(tracker, control_tracker=None):
 
 def run_single(config, steps, output, report_every, tail_average_steps, advisor=None,
                parameter_set_id=1, repeat_index=1, repeats=1, save_details=True,
-               paired_control=True, early_average_steps=100):
+               paired_control=True, early_average_steps=100, quiet=False, cancel_check=None):
     """独立初始化并返回汇总；精简输出仅保存逐轮统计和最终网格。"""
+    def check_cancelled():
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("批次已停止，取消本次实验。")
+
+    check_cancelled()
     simulation = SpatialPrisonersDilemma(config, advisor=advisor if advisor is not None else request_advice)
     # 让两模型各自用同种子生成初态，不传initial_grid，以保持初始化对随机流的正常消耗。
     control_config = replace(config, lambda_prob=0.0) if paired_control else None
@@ -437,10 +459,12 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
     config_path = output / "config.json"
     if save_details:
         write_json(config_path, metadata)
-    print(f"输出目录：{output}", flush=True)
-    print(f"LLM 咨询资格：{config.llm_access_count}/{config.size ** 2} 个体，"
-          f"P={config.llm_access_fraction}，有资格者每次咨询概率 λ={config.lambda_prob}", flush=True)
+    if not quiet:
+        print(f"输出目录：{output}", flush=True)
+        print(f"LLM 咨询资格：{config.llm_access_count}/{config.size ** 2} 个体，"
+              f"P={config.llm_access_fraction}，有资格者每次咨询概率 λ={config.lambda_prob}", flush=True)
     try:
+        check_cancelled()
         if save_details:
             write_grid(output / "initial_grid.csv", simulation.grid)
             write_grid(output / "llm_access_grid.csv",
@@ -459,6 +483,8 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
             writer.writeheader()
             writer.writerow(initial_row)
             for _ in range(steps):
+                # 在完整实验/对照步之间响应取消，保证保存的每一行仍是一对完整观测。
+                check_cancelled()
                 final = simulation.step()
                 if control is not None:
                     control_final = control.step()
@@ -469,8 +495,9 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
                     totals[name] += getattr(final, name)
                 metadata["completed_steps"] = final.round
                 if report_every and final.round % report_every == 0:
-                    print(f"步数 {final.round}/{steps} | 合作率 {final.cooperation_rate:.4f} "
-                          f"| 平均收益 {final.average_payoff:.4f}", flush=True)
+                    if not quiet:
+                        print(f"步数 {final.round}/{steps} | 合作率 {final.cooperation_rate:.4f} "
+                              f"| 平均收益 {final.average_payoff:.4f}", flush=True)
                     file.flush()
         write_grid(output / "final_grid.csv", simulation.grid)
         if not tail:
@@ -527,9 +554,10 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
             if save_details:
                 write_json(config_path, metadata)
 
-    print(f"实验完成：{final.round} 步，最终合作率 {final.cooperation_rate:.4f}，"
-          f"末段平均合作率 {summary['tail_mean_cooperation_rate']:.4f}，"
-          f"平均收益 {final.average_payoff:.4f}", flush=True)
+    if not quiet:
+        print(f"实验完成：{final.round} 步，最终合作率 {final.cooperation_rate:.4f}，"
+              f"末段平均合作率 {summary['tail_mean_cooperation_rate']:.4f}，"
+              f"平均收益 {final.average_payoff:.4f}", flush=True)
     return summary
 
 
@@ -538,6 +566,7 @@ def run_batch(args, configs, scan_values, advisors):
     mode = "scan" if args.scan else "repeat"
     label = "扫描" if args.scan else "重复实验"
     save_details = not args.scan or args.scan_save_details
+    actual_workers = min(args.workers, len(configs))
     output = args.output_dir / (mode + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     output.mkdir(parents=True, exist_ok=False)
     metadata = {
@@ -565,7 +594,11 @@ def run_batch(args, configs, scan_values, advisors):
         "output_dir_semantics": "summary_paths_relative_to_batch_directory",
         "total_runs": len(configs),
         "total_control_runs": len(configs) if args.paired_fermi_control else 0,
+        "requested_workers": args.workers,
+        "actual_workers": actual_workers,
+        "parallel_start_method": "spawn" if actual_workers > 1 else None,
         "completed_runs": 0,
+        "completed_run_ids": [],
         "failed_run_id": None,
         "status": "running",
     }
@@ -573,6 +606,8 @@ def run_batch(args, configs, scan_values, advisors):
     write_json(config_path, metadata)
     print(f"{label}开始：{metadata['parameter_sets']} 组参数，每组 {args.repeats} 次，"
           f"共 {len(configs)} 次运行；汇总文件：{output / 'summary.csv'}", flush=True)
+    print(f"并行进程数：{actual_workers}（设置值 {args.workers}）；"
+          "每个任务包含一次实验及其启用的配对对照。", flush=True)
     if not save_details:
         print("扫描使用精简输出：每个子目录仅保存 history.csv 和 final_grid.csv。", flush=True)
     if args.paired_fermi_control:
@@ -592,37 +627,71 @@ def run_batch(args, configs, scan_values, advisors):
     fields += ["early_start_round", "early_end_round", "payoff_tail_start_round",
                "payoff_tail_end_round", "payoff_windows_overlap"]
     fields += [prefix + name for name in CONTROL_OUTCOME_FIELDS for prefix in ("control_", "delta_")]
-    active_run_id = None
-    try:
-        with (output / "summary.csv").open("w", newline="", encoding="utf-8") as file:
+    tasks = []
+    for run_id, config in enumerate(configs, start=1):
+        parameter_set_id = (run_id - 1) // args.repeats + 1
+        repeat_index = (run_id - 1) % args.repeats + 1
+        name = (f"run_{run_id:04d}_b{config.b}_k{config.k}"
+                f"_lambda{config.lambda_prob}_p{config.llm_access_fraction}"
+                f"_repeat{repeat_index:03d}_seed{config.seed}")
+        tasks.append((run_id, dict(
+            config=config, steps=args.steps, output=output / name,
+            report_every=args.report_every, tail_average_steps=args.tail_average_steps,
+            advisor=advisors[run_id - 1], parameter_set_id=parameter_set_id,
+            repeat_index=repeat_index, repeats=args.repeats,
+            save_details=save_details, paired_control=args.paired_fermi_control,
+            early_average_steps=args.early_average_steps,
+        )))
+
+    completed_rows = {}
+
+    def save_summary():
+        # 只有主进程写汇总；任务即使乱序完成，也按原run_id保存。
+        # 临时文件关闭后再替换，避免中断重写时损坏此前已完成的汇总。
+        temporary = output / "summary.csv.tmp"
+        with temporary.open("w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fields)
             writer.writeheader()
-            file.flush()
-            for run_id, config in enumerate(configs, start=1):
+            writer.writerows(completed_rows[run_id] for run_id in sorted(completed_rows))
+        temporary.replace(output / "summary.csv")
+
+    def on_result(run_id, summary):
+        name = tasks[run_id - 1][1]["output"].name
+        completed_rows[run_id] = dict(summary, run_id=run_id, output_dir=name)
+        save_summary()
+        metadata["completed_runs"] = len(completed_rows)
+        metadata["completed_run_ids"] = sorted(completed_rows)
+        write_json(config_path, metadata)
+        print(f"[已完成 {len(completed_rows)}/{len(configs)}] run_{run_id:04d}，"
+              f"b={summary['b']}, K={summary['k']}, λ={summary['lambda_prob']}, "
+              f"P={summary['llm_access_fraction']}, seed={summary['seed']} | "
+              f"末段平均合作率 {summary['tail_mean_cooperation_rate']:.4f}", flush=True)
+
+    active_run_id = None
+    try:
+        save_summary()
+        if actual_workers > 1:
+            run_parallel(tasks, actual_workers, on_result)
+        else:
+            for run_id, kwargs in tasks:
                 active_run_id = run_id
-                parameter_set_id = (run_id - 1) // args.repeats + 1
-                repeat_index = (run_id - 1) % args.repeats + 1
-                name = (f"run_{run_id:04d}_b{config.b}_k{config.k}"
-                        f"_lambda{config.lambda_prob}_p{config.llm_access_fraction}"
-                        f"_repeat{repeat_index:03d}_seed{config.seed}")
-                print(f"[{run_id}/{len(configs)}] 参数组 {parameter_set_id}，重复 {repeat_index}/{args.repeats}，"
-                      f"b={config.b}, K={config.k}, "
-                      f"λ={config.lambda_prob}, P={config.llm_access_fraction}, seed={config.seed}", flush=True)
-                summary = run_single(config, args.steps, output / name,
-                                     args.report_every, args.tail_average_steps, advisor=advisors[run_id - 1],
-                                     parameter_set_id=parameter_set_id,
-                                     repeat_index=repeat_index, repeats=args.repeats,
-                                     save_details=save_details, paired_control=args.paired_fermi_control,
-                                     early_average_steps=args.early_average_steps)
-                writer.writerow(dict(summary, run_id=run_id, output_dir=name))
-                file.flush()
-                metadata["completed_runs"] = run_id
-                write_json(config_path, metadata)
+                print(f"[{run_id}/{len(configs)}] 参数组 {kwargs['parameter_set_id']}，"
+                      f"重复 {kwargs['repeat_index']}/{args.repeats}", flush=True)
+                on_result(run_id, run_single(**kwargs))
                 active_run_id = None
         metadata["status"] = "completed"
-    except BaseException:
+    except BaseException as exc:
         metadata["status"] = "failed_or_interrupted"
-        metadata["failed_run_id"] = active_run_id
+        metadata["failed_run_id"] = exc.run_id if isinstance(exc, ParallelRunError) else active_run_id
+        # Ctrl+C 可能恰好打断某次成功回调的落盘；工作进程退出后再次提交已收集结果。
+        # 回调不能重试（可能有其它副作用），这里只恢复主进程掌握的汇总快照。
+        try:
+            save_summary()
+            metadata["completed_runs"] = len(completed_rows)
+            metadata["completed_run_ids"] = sorted(completed_rows)
+        except Exception as save_error:
+            # 例如磁盘写入失败时保留原始异常，避免将实验失败原因替换为收尾错误。
+            print(f"汇总收尾保存失败：{save_error}", file=sys.stderr, flush=True)
         raise
     finally:
         write_json(config_path, metadata)
@@ -634,6 +703,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         configs, scan_values = prepare_configs(args)
+        if sys.platform == "win32" and min(args.workers, len(configs)) > 61:
+            raise ValueError("Windows 最多支持61个并行进程，请减小 NUM_WORKERS / --workers。")
         # 所有组合预检完成后再开始扫描，避免数据缺失或边界不支持造成半批实验。
         advisors = [create_advisor(config, args.advisor_batch) for config in configs]
     except (OSError, ValueError, TypeError, OverflowError) as exc:
@@ -660,4 +731,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     raise SystemExit(main())
