@@ -1,13 +1,15 @@
-"""使用 GPT-5.5 进行一次或连续两次空间囚徒困境决策咨询。
+"""使用 GPT-5.5 或本地 Qwen 进行空间囚徒困境决策咨询。
 
 安装依赖：python -m pip install -r requirements.txt
 在项目目录运行：python main/GPT_onestep_test.py
 直接修改 USER_PROMPT 和 USER_PROMPT_2 中的 3×3 C/D 网格；中心是第 2 行第 2 列。
 SINGLE_QUESTION=True 时只询问 USER_PROMPT；False 时依次询问 USER_PROMPT 和 USER_PROMPT_2。
-每次只为中心个体输出 C 或 D。第一轮发送 SYSTEM_PROMPT。
-多轮模式通过 previous_response_id 续接，共用 HTTP 客户端保留连接池和 Cookie，依赖平台响应存储。
-多轮模式保留上下文，不是独立图案采样；第二张网格由你填写，不由第一轮建议自动演化。
-store=True，最多发送一或两次请求，可能产生 API 费用。
+每次只为中心个体输出 C 或 D。GPT 首轮发送 SYSTEM_PROMPT；Qwen 每轮都发送。
+PROVIDER="gpt" 读取 API/gpt.env；"qwen" 读取 API/Qwen.env，也可用 --provider qwen 选择。
+QWEN_REASONING_EFFORT 默认 medium，可改为 low/medium/xhigh，或用 --qwen-reasoning-effort 覆盖。
+GPT 多轮模式通过 previous_response_id 续接，共用 HTTP 客户端，依赖平台响应存储。
+Qwen 每轮只发送当前 SYSTEM_PROMPT 和 USER_PROMPT，独立新建客户端，用完关闭，不继承历史。
+第二张网格由你填写，不由第一轮建议自动演化。最多发送一或两次请求，可能产生 API 费用。
 各轮的输入、输出和状态逐轮保存到 logs/GPT_onestep_test/ 下同一个独立 JSON 文件。
 错误写入 stderr，并以非零状态退出；失败时停止，不自动重试。
 检查已有第一轮记录：python main/GPT_onestep_test.py --check-response 日志文件路径
@@ -21,6 +23,7 @@ import re
 import ssl
 import sys
 import time
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -28,17 +31,28 @@ from uuid import uuid4
 
 if __package__:
     from .GPT_test import APIError as ConfigError, DEFAULT_ENV_FILE, load_config
+    from .llm_provider import (PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS,
+                               build_qwen_request, chat_response_record, load_qwen_config,
+                               normalize_provider, normalize_qwen_reasoning_effort, provider_env_file,
+                               validate_chat_response)
 else:
     from GPT_test import APIError as ConfigError, DEFAULT_ENV_FILE, load_config
+    from llm_provider import (PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS,
+                              build_qwen_request, chat_response_record, load_qwen_config,
+                              normalize_provider, normalize_qwen_reasoning_effort, provider_env_file,
+                              validate_chat_response)
 
 
-MODEL = "gpt-5.5"
+PROVIDER = "gpt"  # "gpt"：API/gpt.env；"qwen"：API/Qwen.env。
+MODEL = "gpt-5.5"  # GPT 使用此模型；Qwen 使用 llm_provider.py 中的 QWEN_MODEL。
 SINGLE_QUESTION = True  # True：只问 USER_PROMPT；False：连续问 USER_PROMPT 和 USER_PROMPT_2。
 MAX_OUTPUT_TOKENS = 10240  # 推理和最终回答共用此上限；1024 曾在推理阶段耗尽。
 TIMEOUT_SECONDS = 120
 # True：沿用代理和证书环境设置；False：忽略这些环境设置，用默认验证证书直接连接。
 # 排查 TLS/代理故障时可切换；不修改系统设置，也不会自动切换或重试。
 TRUST_ENV = True
+QWEN_TRUST_ENV = False  # 本地服务默认直接连接；需环境代理/证书时可改为 True。
+QWEN_REASONING_EFFORT = "medium"  # 仅 Qwen：可选 "low"、"medium"、"xhigh"。
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs" / "GPT_onestep_test"
 LOG_TIMEZONE = timezone(timedelta(hours=8), "Asia/Shanghai")
 
@@ -93,7 +107,7 @@ What action would you recommend for the center player in the next round to maxim
 Return only one action: C or D."""
 
 # 示例 2：与上面仅左上角不同；中心仍为 C，四个直接邻居的位置和策略均相同。
-# 可单独编辑；第二次咨询仍会带着第一次的对话上下文。
+# 可单独编辑；GPT 第二次带有第一轮上下文，Qwen 每次独立咨询。
 USER_PROMPT_2 = """Game state:
 
 Current local 3x3 grid (C = Cooperate, D = Defect):
@@ -124,7 +138,23 @@ class RunError(Exception):
         self.diagnostics = diagnostics
 
 
-def build_request(user_prompt, *, previous_response_id=None):
+def selected_qwen_reasoning_effort(provider, value=None):
+    """选择当前 Qwen 强度，不修改模块配置，也不改变 GPT 请求。"""
+    if provider != "qwen":
+        if value is not None:
+            raise ValueError("Qwen 思考强度只适用于 provider=qwen。")
+        return None
+    return normalize_qwen_reasoning_effort(QWEN_REASONING_EFFORT if value is None else value)
+
+
+def build_request(user_prompt, *, previous_response_id=None, provider=None, qwen_reasoning_effort=None):
+    provider = normalize_provider(PROVIDER if provider is None else provider)
+    effort = selected_qwen_reasoning_effort(provider, qwen_reasoning_effort)
+    if provider == "qwen":
+        if previous_response_id is not None:
+            raise ValueError("Qwen 使用独立咨询，不能传入 previous_response_id。")
+        return build_qwen_request(SYSTEM_PROMPT, user_prompt, model=QWEN_MODEL,
+                                  max_tokens=MAX_OUTPUT_TOKENS, reasoning_effort=effort)
     messages = [{"role": "user", "content": user_prompt}]
     if previous_response_id is None:
         # instructions 不会随 previous_response_id 继承，因此把系统指令作为首条消息保存。
@@ -227,12 +257,23 @@ def save_record(path, record, api_key=""):
     temporary.replace(path)
 
 
-def ask_advisor(client, user_prompt=USER_PROMPT, *, record=None, previous_response_id=None):
+def ask_advisor(client, user_prompt=USER_PROMPT, *, record=None, previous_response_id=None,
+                provider=None, qwen_reasoning_effort=None):
     """发起一轮咨询；有响应 ID 时延续对话，在验证前记录原始输出。"""
-    request = build_request(user_prompt, previous_response_id=previous_response_id)
+    provider = normalize_provider(PROVIDER if provider is None else provider)
+    request = build_request(user_prompt, previous_response_id=previous_response_id, provider=provider,
+                            qwen_reasoning_effort=qwen_reasoning_effort)
     if record is not None:
         record["request"] = request
         record["api_call_started"] = True
+    if provider == "qwen":
+        response = client.chat.completions.create(**request)
+        if record is not None:
+            record["output_text"], record["response"] = chat_response_record(response)
+        try:
+            return validate_chat_response(response)
+        except ValueError as exc:
+            raise AdviceError(str(exc)) from None
     response = client.responses.create(**request)
     if record is not None:
         record["output_text"] = getattr(response, "output_text", None)
@@ -264,11 +305,14 @@ def ask_advisor(client, user_prompt=USER_PROMPT, *, record=None, previous_respon
     return text.strip()
 
 
-def create_client(api_key, base_url):
-    """为整段对话保留同一个 HTTP 客户端、连接池和 Cookie。"""
+def create_client(api_key, base_url, *, provider=None):
+    """创建客户端：GPT 连续对话共享；Qwen 每轮创建并关闭。"""
     from openai import DefaultHttpxClient, OpenAI
 
-    http_client = DefaultHttpxClient(trust_env=TRUST_ENV, verify=True)
+    provider = normalize_provider(PROVIDER if provider is None else provider)
+    http_client = DefaultHttpxClient(
+        trust_env=QWEN_TRUST_ENV if provider == "qwen" else TRUST_ENV, verify=True,
+    )
     try:
         return OpenAI(
             api_key=api_key,
@@ -283,17 +327,27 @@ def create_client(api_key, base_url):
 
 
 def run_advisor(api_key, base_url, record, *, user_prompt=USER_PROMPT, previous_response_id=None,
-                client=None):
+                client=None, provider=None, qwen_reasoning_effort=None):
+    provider = normalize_provider(PROVIDER if provider is None else provider)
+    effort = selected_qwen_reasoning_effort(provider, qwen_reasoning_effort)
     # ImportError 交由 main 统一处理，也覆盖客户端初始化时加载的代理依赖。
     from openai import APIConnectionError, APIStatusError, APITimeoutError
     from openai import APIError as SDKError
 
+    if provider == "qwen" and previous_response_id is not None:
+        raise ValueError("Qwen 使用独立咨询，不能传入 previous_response_id。")
     try:
+        # Qwen 即使收到外部 client，也由本轮独立创建/关闭客户端，避免共享 Cookie 或会话。
+        if provider == "qwen":
+            with create_client(api_key, base_url, provider=provider) as standalone_client:
+                return ask_advisor(standalone_client, user_prompt, record=record, provider=provider,
+                                   qwen_reasoning_effort=effort)
         if client is None:
-            with create_client(api_key, base_url) as standalone_client:
+            with create_client(api_key, base_url, provider=provider) as standalone_client:
                 return ask_advisor(standalone_client, user_prompt, record=record,
-                                   previous_response_id=previous_response_id)
-        return ask_advisor(client, user_prompt, record=record, previous_response_id=previous_response_id)
+                                   previous_response_id=previous_response_id, provider=provider)
+        return ask_advisor(client, user_prompt, record=record, previous_response_id=previous_response_id,
+                           provider=provider)
     except APITimeoutError as exc:
         raise RunError(
             "请求超时，请检查网络或增大 TIMEOUT_SECONDS；底层原因详见日志 error.diagnostics。",
@@ -342,6 +396,8 @@ def run_advisor(api_key, base_url, record, *, user_prompt=USER_PROMPT, previous_
             429: "请求受限或额度不足。",
         }
         hint = hints.get(exc.status_code, "请检查平台服务状态。")
+        if provider == "qwen" and exc.status_code in {400, 404}:
+            hint = "请检查 Qwen 的 Chat Completions 接口、模型名称和请求参数。"
         if exc.status_code == 400 and previous_response_id is not None:
             hint = "平台拒绝了带 previous_response_id 的续接请求，请根据日志中的服务端详情定位原因。"
         raise RunError(
@@ -353,7 +409,10 @@ def run_advisor(api_key, base_url, record, *, user_prompt=USER_PROMPT, previous_
         raise RunError("SDK 无法处理接口返回，请检查平台的 OpenAI 接口兼容性。", "sdk_error") from None
 
 
-def main():
+def main(provider=None, qwen_reasoning_effort=None):
+    provider = normalize_provider(PROVIDER if provider is None else provider)
+    effort = selected_qwen_reasoning_effort(provider, qwen_reasoning_effort)
+    env_file = provider_env_file(provider)
     user_prompts = [USER_PROMPT] if SINGLE_QUESTION else [USER_PROMPT, USER_PROMPT_2]
     started = datetime.now(LOG_TIMEZONE)
     timer = time.perf_counter()
@@ -366,16 +425,22 @@ def main():
         "duration_seconds": None,
         "runtime": None,
         "base_url": None,
-        "client_options": {"timeout_seconds": TIMEOUT_SECONDS, "max_retries": 0, "trust_env": TRUST_ENV,
-                           "shared_across_turns": True},
-        "request": build_request(USER_PROMPT),
+        "provider": provider,
+        "qwen_reasoning_effort": effort,
+        "env_file": str(env_file),
+        "api_interface": "chat.completions" if provider == "qwen" else "responses",
+        "client_options": {"timeout_seconds": TIMEOUT_SECONDS, "max_retries": 0,
+                           "trust_env": QWEN_TRUST_ENV if provider == "qwen" else TRUST_ENV,
+                           "shared_across_turns": provider == "gpt"},
+        "request": build_request(USER_PROMPT, provider=provider, qwen_reasoning_effort=effort),
         "status": "running",
         "action": None,
         "output_text": None,
         "response": None,
         "error": None,
         "single_question": SINGLE_QUESTION,
-        "conversation_mode": "single_turn" if SINGLE_QUESTION else "previous_response_id",
+        "conversation_mode": ("independent_turns" if provider == "qwen" else
+                              "single_turn" if SINGLE_QUESTION else "previous_response_id"),
         "planned_turns": len(user_prompts),
         "completed_turns": 0,
         "user_prompts": user_prompts,
@@ -402,16 +467,19 @@ def main():
 
     try:
         record["runtime"] = runtime_info()
-        api_key, base_url = load_config(DEFAULT_ENV_FILE)
+        api_key, base_url = load_qwen_config() if provider == "qwen" else load_config(DEFAULT_ENV_FILE)
         record["base_url"] = base_url
         previous_response_id = None
-        with create_client(api_key, base_url) as client:
+        # GPT 保存原有连续会话逻辑；Qwen 的 run_advisor 每轮负责新建和关闭独立客户端。
+        context = create_client(api_key, base_url, provider=provider) if provider == "gpt" else nullcontext(None)
+        with context as client:
             for turn_number, user_prompt in enumerate(record["user_prompts"], start=1):
                 current_turn = {
                     "turn": turn_number,
                     "started_at": datetime.now(LOG_TIMEZONE).isoformat(timespec="milliseconds"),
                     "finished_at": None, "duration_seconds": None,
-                    "request": build_request(user_prompt, previous_response_id=previous_response_id),
+                    "request": build_request(user_prompt, previous_response_id=previous_response_id,
+                                             provider=provider, qwen_reasoning_effort=effort),
                     "api_call_started": False, "status": "running", "action": None,
                     "output_text": None, "response": None, "error": None,
                 }
@@ -424,7 +492,7 @@ def main():
                     current_turn["action"] = run_advisor(
                         api_key, base_url, current_turn,
                         user_prompt=user_prompt, previous_response_id=previous_response_id,
-                        client=client,
+                        client=client, provider=provider, qwen_reasoning_effort=effort,
                     )
                     current_turn["status"] = "success"
                     record["completed_turns"] += 1
@@ -435,7 +503,7 @@ def main():
                         record[name] = current_turn[name]
                 checkpoint()  # 本轮结果成功保存后才允许进行下一轮。
                 print(f"第 {turn_number} 轮建议：{current_turn['action']}", flush=True)
-                if turn_number < record["planned_turns"]:
+                if provider == "gpt" and turn_number < record["planned_turns"]:
                     response = current_turn["response"]
                     previous_response_id = response.get("id") if isinstance(response, dict) else None
                     if not isinstance(previous_response_id, str) or not previous_response_id.strip():
@@ -463,7 +531,8 @@ def main():
             "diagnostics": exception_diagnostics(exc, api_key),
         }
     except (OSError, UnicodeError):
-        record["error"] = {"type": "configuration_error", "message": "无法读取配置，请检查 API/gpt.env 的权限和 UTF-8 编码。"}
+        record["error"] = {"type": "configuration_error",
+                           "message": f"无法读取配置，请检查 API/{env_file.name} 的权限和 UTF-8 编码。"}
     except ValueError:
         record["error"] = {"type": "format_error", "message": "配置或接口返回格式异常，请检查 API 地址。"}
     except KeyboardInterrupt:
@@ -549,7 +618,7 @@ def check_response_log(log_file):
     exit_code = 1
     message = ""
     try:
-        with create_client(api_key, base_url) as client:
+        with create_client(api_key, base_url, provider="gpt") as client:
             record["api_call_started"] = True
             response = client.responses.retrieve(response_id)
         returned_id = getattr(response, "id", None)
@@ -606,10 +675,24 @@ def check_response_log(log_file):
 def cli(argv=None):
     parser = argparse.ArgumentParser(description="按 SINGLE_QUESTION 设置进行一次或两轮决策咨询，或只查询已有响应记录。")
     parser.add_argument("--check-response", metavar="LOG_FILE", help="只查询日志中的第一轮响应，不生成新回答")
+    parser.add_argument("--provider", type=normalize_provider, choices=PROVIDERS, default=None,
+                        help="gpt 读取 API/gpt.env；qwen 读取 API/Qwen.env，每轮独立咨询")
+    parser.add_argument("--qwen-reasoning-effort", type=normalize_qwen_reasoning_effort,
+                        choices=QWEN_REASONING_EFFORTS, default=None,
+                        help="仅 Qwen：思考强度 low/medium/xhigh，默认读取 QWEN_REASONING_EFFORT")
     args = parser.parse_args(argv)
+    try:
+        provider = normalize_provider(PROVIDER if args.provider is None else args.provider)
+        effort = selected_qwen_reasoning_effort(provider, args.qwen_reasoning_effort)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.check_response is not None:
+        if args.qwen_reasoning_effort is not None:
+            parser.error("--qwen-reasoning-effort 不能用于 --check-response。")
+        if provider != "gpt":
+            parser.error("--check-response 仅适用于 GPT Responses；Qwen 不存储可续接的响应。")
         return check_response_log(args.check_response)
-    return main()
+    return main(provider=provider, qwen_reasoning_effort=effort)
 
 
 if __name__ == "__main__":

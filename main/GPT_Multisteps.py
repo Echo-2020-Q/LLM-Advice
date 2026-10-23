@@ -1,9 +1,14 @@
-"""独立重复咨询 GPT-5.5：全部 512 种 3×3 C/D 网格，每种重复 n 次。
+"""独立重复咨询 GPT 或 Qwen：全部 512 种 3×3 C/D 网格，每种重复 n 次。
 
 中心是第 2 行第 2 列，上下左右为直接邻居，四角提供空间信息。
 每次请求只包含系统指令和当前网格，没有历史；不合并旋转或镜像图案。
 B=None 时不在用户提示词中添加 b 的说明；请自行在 SYSTEM_PROMPT 中填写。
 运行：python main/GPT_Multisteps.py --n 10
+选择 Qwen：python main/GPT_Multisteps.py --provider qwen --n 10
+Qwen 思考强度：文件顶部 QWEN_REASONING_EFFORT，或 --qwen-reasoning-effort medium。
+可选 low、medium、xhigh；续跑保留原批次强度，改变强度请创建新批次。
+PROVIDER="gpt" 读取 API/gpt.env；"qwen" 读取 API/Qwen.env。
+Qwen 每次仅发送系统提示词和当前网格，关闭提示词缓存，请求结束后关闭客户端。
 仅预览：python main/GPT_Multisteps.py --n 10 --dry-run
 如需明确给出某个数值，仍可指定 --b 1.5。
 旧式十组合批次仍可通过 --resume 续跑，沿用保存的原始提示词。
@@ -13,6 +18,7 @@ TLS/SSL 连接异常关闭时默认额外重试 5 次，每次间隔 5 秒；--t
 续跑预览：在上述命令后加 --dry-run，不读取密钥、不发送请求、不改日志。
 直接在 IDE 中运行时，使用下方 B、N 的默认值。
 结果保存在 logs/GPT_Multistepsa/ 的独立批次目录中。
+每条完成后显示本次已用时和预计剩余时间；根据当前运行平均耗时估算，包含重试和等待。
 """
 
 import argparse
@@ -31,21 +37,32 @@ from uuid import uuid4
 if __package__:
     from .GPT_test import APIError as ConfigError, DEFAULT_ENV_FILE, load_config
     from .GPT_onestep_test import LOG_TIMEZONE, exception_diagnostics, redact, runtime_info, save_record
+    from .llm_provider import (PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS,
+                               build_qwen_request, chat_response_record, load_qwen_config,
+                               normalize_provider, normalize_qwen_reasoning_effort,
+                               provider_env_file, validate_chat_response)
 else:
     from GPT_test import APIError as ConfigError, DEFAULT_ENV_FILE, load_config
     from GPT_onestep_test import LOG_TIMEZONE, exception_diagnostics, redact, runtime_info, save_record
+    from llm_provider import (PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS,
+                              build_qwen_request, chat_response_record, load_qwen_config,
+                              normalize_provider, normalize_qwen_reasoning_effort,
+                              provider_env_file, validate_chat_response)
 
 
 B = None  # None：b 的说明由 SYSTEM_PROMPT 提供；数值：在用户提示词中明确告知该值。
-N = 2  # 每个网格重复的次数；N=10 时共有 5120 次独立请求。
+N = 100 # 每个网格重复的次数；N=10 时共有 5120 次独立请求。
 OBSERVATION_FORMAT = "grid_3x3"  # 新批次使用完整 512 种网格；neighbor_counts 保留用于旧格式兼容。
+PROVIDER = "qwen"  # "gpt" 使用 API/gpt.env；"qwen" 使用 API/Qwen.env。
+QWEN_REASONING_EFFORT = "medium"  # 仅 Qwen："low"、"medium"、"xhigh"；新批次生效。
 MODEL = "gpt-5.5"
 MAX_OUTPUT_TOKENS = 10240  # 内部推理和最终回答共用此上限。
-TIMEOUT_SECONDS = 180
+TIMEOUT_SECONDS = 1800
 TLS_RETRIES = 5  # 每条请求连接异常关闭后的额外重试次数；0 表示关闭。
 RETRY_DELAY_SECONDS = 5  # 重试前等待秒数，可按 Ctrl+C 中断。
 # True：沿用环境中的代理/证书设置；False：直连并使用默认验证证书。
 TRUST_ENV = True
+QWEN_TRUST_ENV = False  # 本地部署默认直连，避免被系统代理转发；可用 --trust-env 覆盖。
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs" / "GPT_Multistepsa"
 
 # 从单步脚本复制的系统提示词，可在这里单独编辑。
@@ -85,6 +102,8 @@ CSV_FIELDS = [
     "output_text", "duration_seconds", "response_id", "input_tokens",
     "output_tokens", "total_tokens", "error", "record_file",
     "observation_format", "grid_key", "grid_rows",
+    "provider", "model", "api_interface",
+    "qwen_reasoning_effort",
 ]
 
 
@@ -159,8 +178,13 @@ What action would you recommend for this player in the next round?
 Return only one action: C or D."""
 
 
-def make_request(case, max_tokens):
+def make_request(case, max_tokens, provider=None, *, qwen_reasoning_effort=None):
     # 每次只发送当前状态，没有 previous_response_id、conversation 或以前的输入/输出。
+    provider = normalize_provider(PROVIDER if provider is None else provider)
+    if provider == "qwen":
+        effort = QWEN_REASONING_EFFORT if qwen_reasoning_effort is None else qwen_reasoning_effort
+        return build_qwen_request(SYSTEM_PROMPT, build_user_prompt(case),
+                                  model=QWEN_MODEL, max_tokens=max_tokens, reasoning_effort=effort)
     if "grid_rows" in case:
         return {"model": MODEL,
                 "input": [{"role": "system", "content": SYSTEM_PROMPT},
@@ -168,6 +192,17 @@ def make_request(case, max_tokens):
                 "max_output_tokens": max_tokens, "store": False}
     return {"model": MODEL, "instructions": SYSTEM_PROMPT,
             "input": build_user_prompt(case), "max_output_tokens": max_tokens, "store": False}
+
+
+def provider_metadata(provider):
+    return {"provider": provider,
+            "api_interface": "chat.completions" if provider == "qwen" else "responses",
+            "env_file": "API/" + provider_env_file(provider).name}
+
+
+def load_provider_config(provider):
+    # 旧 GPT 配置与测试入口保持不变；Qwen 不回退到 GPT 密钥或地址。
+    return load_qwen_config() if provider == "qwen" else load_config(DEFAULT_ENV_FILE)
 
 
 def describe_case(case):
@@ -180,6 +215,28 @@ def describe_case(case):
 
 def now():
     return datetime.now(LOG_TIMEZONE).isoformat(timespec="milliseconds")
+
+
+def format_duration(seconds):
+    """时长显示为 时:分:秒，超过一天时另列天数。"""
+    days, seconds = divmod(math.ceil(max(0, seconds)), 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    clock = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{days}天 {clock}" if days else clock
+
+
+def format_progress(started, completed, total, *, stopped=False):
+    """按本次进程的实际平均耗时估算；续跑不计入停机时间或跳过的成功项。"""
+    elapsed = max(0, time.perf_counter() - started)
+    remaining = max(0, total - completed)
+    if stopped:
+        estimate = f"已停止，本次剩余 {remaining} 条未执行"
+    elif completed == 0:
+        estimate = "预计剩余：首条完成后估算"
+    else:
+        estimate = f"预计剩余约 {format_duration(elapsed / completed * remaining)}"
+    return f"本次已用时 {format_duration(elapsed)} | {estimate}"
 
 
 def is_tls_connection_closed(diagnostics):
@@ -212,6 +269,16 @@ def call_once(openai, api_key, base_url, record, timeout):
         with openai.OpenAI(api_key=api_key, base_url=base_url,
                            timeout=timeout, max_retries=0, http_client=http_client) as client:
             record["api_call_started"] = True
+            if record.get("provider", "gpt") == "qwen":
+                response = client.chat.completions.create(**record["request"])
+                record["output_text"], record["response"] = chat_response_record(response)
+                try:
+                    record["action"] = validate_chat_response(record["response"])
+                except ValueError as exc:
+                    record["error"] = {"type": "invalid_advice", "message": str(exc)}
+                else:
+                    record["status"] = "success"
+                return  # with/finally 仍会关闭本次独立客户端，包括无效回答。
             response = client.responses.create(**record["request"])
             record["output_text"] = getattr(response, "output_text", None)
             dump = getattr(response, "model_dump", None)
@@ -356,11 +423,18 @@ def csv_row(record, filename):
         "defecting_neighbors": case["defecting_neighbors"],
         "status": record["status"], "recommendation": record["action"] or "",
         "output_text": record["output_text"], "duration_seconds": record["duration_seconds"],
-        "response_id": response.get("id", ""), "input_tokens": usage.get("input_tokens", ""),
-        "output_tokens": usage.get("output_tokens", ""), "total_tokens": usage.get("total_tokens", ""),
+        "response_id": response.get("id", ""),
+        "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens", "")),
+        "output_tokens": usage.get("output_tokens", usage.get("completion_tokens", "")),
+        "total_tokens": usage.get("total_tokens", ""),
         "error": (record["error"] or {}).get("message", ""), "record_file": filename,
         "observation_format": "grid_3x3" if "grid_rows" in case else "neighbor_counts",
         "grid_key": case.get("grid_key", ""), "grid_rows": "/".join(case.get("grid_rows", [])),
+        "provider": record.get("provider", "gpt"),
+        "model": record.get("request", {}).get("model", ""),
+        "api_interface": provider_metadata(record.get("provider", "gpt"))["api_interface"],
+        "qwen_reasoning_effort": (record.get("request", {}).get("extra_body", {}).get(
+            "reasoning_effort", "server_default") if record.get("provider", "gpt") == "qwen" else ""),
     }
 
 
@@ -421,10 +495,16 @@ def read_batch(directory):
 
     config = read_json(directory / "config.json")
     try:
+        provider = normalize_provider(config.get("provider", "gpt"))
+        effort = config.get("qwen_reasoning_effort")
+        if effort is not None and (provider != "qwen" or normalize_qwen_reasoning_effort(effort) != effort):
+            raise ValueError
+        api_interface = provider_metadata(provider)["api_interface"]
         observation_format = config.get("observation_format", "neighbor_counts")
         expected_cases = build_cases(config["b"], observation_format)
         case_count = len(expected_cases)
         if (type(config["n"]) is not int or config["n"] < 1
+                or config.get("provider", "gpt") != provider
                 or not valid_b(config["b"])
                 or any(config.get(key) != value for key, value in b_metadata(config["b"]).items()
                        if config["b"] is None or key in config)
@@ -434,6 +514,7 @@ def read_batch(directory):
                 or ("case_count" in config and (type(config["case_count"]) is not int
                                                or config["case_count"] != case_count))
                 or ("trust_env" in config and type(config["trust_env"]) is not bool)
+                or config.get("api_interface", api_interface) != api_interface
                 or type(config["max_output_tokens"]) is not int or config["max_output_tokens"] < 16
                 or type(config["timeout_seconds"]) not in (int, float)
                 or not math.isfinite(config["timeout_seconds"]) or config["timeout_seconds"] <= 0
@@ -446,16 +527,30 @@ def read_batch(directory):
         raise ResumeError("缺少 records 目录，不能确定哪些请求已经成功。")
 
     # 网格批次必须有完整的原始请求，不使用今天的提示词重建历史实验。
-    if observation_format == "grid_3x3" and "requests" not in config:
+    if (observation_format == "grid_3x3" or provider == "qwen") and "requests" not in config:
         raise ResumeError("网格批次缺少保存的 requests 模板，已停止续跑。")
     templates = config.get("requests", [None] * case_count)
     if not isinstance(templates, list) or len(templates) != case_count:
         raise ResumeError("config.json 中的请求模板不合法。")
     templates = list(templates)
-    if observation_format == "grid_3x3" and any(template is None for template in templates):
+    if (observation_format == "grid_3x3" or provider == "qwen") and any(template is None for template in templates):
         raise ResumeError("网格批次的请求模板不完整，已停止续跑。")
 
     def check_request(request):
+        if provider == "qwen":
+            messages = request.get("messages") if isinstance(request, dict) else None
+            if (not isinstance(messages, list) or len(messages) != 2
+                    or not isinstance(messages[1], dict)
+                    or not isinstance(messages[1].get("content"), str)
+                    or not messages[1]["content"]):
+                raise ResumeError("Qwen 记录缺少独立的 system/user 请求，已停止续跑。")
+            expected = build_qwen_request(config["system_prompt"], messages[1]["content"],
+                                          model=config["model"], max_tokens=config["max_output_tokens"],
+                                          reasoning_effort=effort)
+            if (request != expected or request.get("stream") is not False
+                    or request.get("extra_body", {}).get("cache_prompt") is not False):
+                raise ResumeError("Qwen 请求与批次配置不一致，或包含历史/缓存/未知参数，已停止续跑。")
+            return
         keys = {"model", "input", "max_output_tokens", "store"}
         if observation_format == "neighbor_counts":
             keys.add("instructions")
@@ -492,6 +587,8 @@ def read_batch(directory):
                 or record.get("repetition") != (index - 1) // case_count + 1
                 or record.get("observation") != config["cases"][case_index]
                 or record.get("base_url") != config["base_url"]
+                or record.get("provider", "gpt") != provider
+                or record.get("api_interface", api_interface) != api_interface
                 or type(record.get("api_call_started")) is not bool
                 or record.get("status") not in {"success", "error", "cancelled", "running"}):
             raise ResumeError(f"{path.name} 与批次计划不匹配或内容不完整。")
@@ -499,8 +596,15 @@ def read_batch(directory):
                 record["action"] not in ("C", "D") or not isinstance(record["output_text"], str)
                 or record["output_text"].strip() != record["action"]
                 or not isinstance(record["response"], dict)
-                or record["response"].get("status") != "completed"):
+                or (provider == "gpt" and record["response"].get("status") != "completed")):
             raise ResumeError(f"{path.name} 的成功标记与输出不一致。")
+        if record["status"] == "success" and provider == "qwen":
+            try:
+                action = validate_chat_response(record["response"])
+                if action != record["action"]:
+                    raise ValueError
+            except ValueError:
+                raise ResumeError(f"{path.name} 的成功标记与原始 Qwen 回复不一致。") from None
         request = record.get("request")
         check_request(request)
         if templates[case_index] is not None and templates[case_index] != request:
@@ -512,7 +616,9 @@ def read_batch(directory):
     for previous in archived:
         index = previous.get("request_index")
         if (type(index) is not int or not 1 <= index <= config["planned_requests"]
-                or previous.get("batch_id") != config["batch_id"]):
+                or previous.get("batch_id") != config["batch_id"]
+                or previous.get("provider", "gpt") != provider
+                or previous.get("api_interface", api_interface) != api_interface):
             raise ResumeError("历史尝试与原批次不匹配，已停止续跑。")
         case_index = (index - 1) % case_count
         request = previous.get("request")
@@ -539,6 +645,8 @@ def read_batch(directory):
 def resumed_summary(config, records, archived, started_at, status):
     """结果按每个计划编号的最新记录计数；历史调用数单独保留。"""
     summary = {
+        **provider_metadata(config.get("provider", "gpt")), "model": config["model"],
+        "qwen_reasoning_effort": config.get("qwen_reasoning_effort"),
         "batch_id": config["batch_id"], "b": config["b"], "n": config["n"], **b_metadata(config["b"]),
         "started_at": started_at, "finished_at": None, "status": status,
         "planned_requests": config["planned_requests"], "processed_cases": len(records),
@@ -595,10 +703,15 @@ def resume_batch(args):
     exit_code = 0
     try:
         config, records, templates, archived = read_batch(directory)
+        provider = config.get("provider", "gpt")
+        if args.provider is not None and args.provider != provider:
+            raise ResumeError(f"原批次使用 {provider}，不能切换为 {args.provider} 续跑；请为新模型创建新批次。")
         pending = [i for i in range(1, config["planned_requests"] + 1)
                    if i not in records or records[i]["status"] != "success"]
-        print(f"续跑批次：{directory}\n模型={config['model']} | {describe_b(config['b'])} | n={config['n']} | "
+        print(f"续跑批次：{directory}\n服务={provider} | 模型={config['model']} | {describe_b(config['b'])} | n={config['n']} | "
               f"{len(config['cases'])} 种局面 | 已成功={config['planned_requests'] - len(pending)} | 待补跑={len(pending)}", flush=True)
+        if provider == "qwen":
+            print(f"Qwen 思考强度={config.get('qwen_reasoning_effort') or '服务端默认（原批次未指定）'}", flush=True)
         if args.dry_run:
             print("待补跑编号：" + (", ".join(map(str, pending)) or "无"), flush=True)
             print("续跑预览完成：未读取密钥、未调用 API、未修改日志。", flush=True)
@@ -615,6 +728,8 @@ def resume_batch(args):
 
         # 在拿到锁之后重新读取，防止等待期间另一进程已写入成功结果。
         config, records, templates, archived = read_batch(directory)
+        if config.get("provider", "gpt") != provider:
+            raise ResumeError("批次的模型服务在读取期间发生变化，已停止续跑。")
         pending = [i for i in range(1, config["planned_requests"] + 1)
                    if i not in records or records[i]["status"] != "success"]
         if not pending:
@@ -622,15 +737,15 @@ def resume_batch(args):
             return 0
         try:
             import openai
-            api_key, configured_url = load_config(DEFAULT_ENV_FILE)
+            api_key, configured_url = load_provider_config(provider)
         except ImportError:
             raise ResumeError("缺少依赖，请运行：python -m pip install -r requirements.txt") from None
         except (ConfigError, OSError, UnicodeError, ValueError):
-            raise ResumeError("无法加载 API/gpt.env，请检查配置。") from None
+            raise ResumeError(f"无法加载 {provider_metadata(provider)['env_file']}，请检查配置。") from None
         if configured_url.rstrip("/") != config["base_url"].rstrip("/"):
             raise ResumeError("当前 API 地址与原批次不同。请先恢复原地址，避免使用错误平台的密钥续跑。")
         timeout = args.timeout if args.timeout is not None else config["timeout_seconds"]
-        trust_env = config.get("trust_env", True) if args.trust_env is None else args.trust_env
+        trust_env = config.get("trust_env", provider == "gpt") if args.trust_env is None else args.trust_env
         case_count = len(config["cases"])
         started_at = min((r["started_at"] for r in records.values()), default=now())
         summary = resumed_summary(config, records, archived, started_at, "running")
@@ -638,12 +753,15 @@ def resume_batch(args):
         write_results(directory, records, api_key)
         save_record(directory / "summary.json", summary, api_key)
 
-        for index in pending:
+        progress_started = time.perf_counter()
+        print(format_progress(progress_started, 0, len(pending)), flush=True)
+        for completed, index in enumerate(pending, start=1):
             record = None
             path = directory / "records" / f"{index:06d}.json"
             case_index = (index - 1) % case_count
             case = config["cases"][case_index]
             candidate = {
+                **provider_metadata(provider),
                 "batch_id": config["batch_id"], "request_index": index,
                 "repetition": (index - 1) // case_count + 1, "combination_index": case_index + 1,
                 "observation": case, "base_url": config["base_url"],
@@ -674,7 +792,10 @@ def resume_batch(args):
             write_results(directory, records, api_key)
             save_record(directory / "summary.json", summary, api_key)
             result = record["action"] if record["status"] == "success" else record["error"]["message"]
-            print(f"{result} ({record['duration_seconds']:.3f}s)", flush=True)
+            stopped = (record["status"] == "cancelled"
+                       or (record["status"] == "error" and not args.continue_on_error))
+            progress = format_progress(progress_started, completed, len(pending), stopped=stopped)
+            print(f"{result} ({record['duration_seconds']:.3f}s) | {progress}", flush=True)
             if record["status"] == "cancelled":
                 summary["status"], exit_code = "cancelled", 130
                 break
@@ -751,6 +872,11 @@ def resume_batch(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--provider", type=normalize_provider, choices=PROVIDERS,
+                        help="gpt 读取 gpt.env；qwen 读取 Qwen.env。新批次默认 PROVIDER，续跑沿用原批次")
+    parser.add_argument("--qwen-reasoning-effort", type=normalize_qwen_reasoning_effort,
+                        choices=QWEN_REASONING_EFFORTS,
+                        help="仅 Qwen 新批次：思考强度，默认读取 QWEN_REASONING_EFFORT")
     parser.add_argument("--b", type=finite_float, help="可选：在用户提示词中给出具体 b；B=None 时由 SYSTEM_PROMPT 说明")
     parser.add_argument("--n", type=positive_int, help="每种组合的重复次数，默认读取文件顶部 N")
     parser.add_argument("--trust-env", action=argparse.BooleanOptionalAction, default=None,
@@ -770,14 +896,27 @@ def main(argv=None):
     if not math.isfinite(args.retry_delay) or args.retry_delay < 0:
         parser.error("--retry-delay 必须为有限非负数")
     if args.resume:
+        if args.qwen_reasoning_effort is not None:
+            parser.error("--resume 沿用原批次思考强度；要修改强度，请去掉 --resume 创建新批次")
         if any(value is not None for value in (args.b, args.n, args.max_tokens)):
             parser.error("--resume 自动恢复原批次配置，不能与 --b、--n、--max-tokens 同用")
         if args.timeout is not None and args.timeout <= 0:
             parser.error("--timeout 必须是正数")
         return resume_batch(args)
+    try:
+        args.provider = normalize_provider(PROVIDER if args.provider is None else args.provider)
+        if args.provider == "qwen":
+            args.qwen_reasoning_effort = normalize_qwen_reasoning_effort(
+                QWEN_REASONING_EFFORT if args.qwen_reasoning_effort is None else args.qwen_reasoning_effort)
+        elif args.qwen_reasoning_effort is not None:
+            parser.error("--qwen-reasoning-effort 仅用于 --provider qwen")
+    except ValueError as exc:
+        parser.error(str(exc))
+    model = QWEN_MODEL if args.provider == "qwen" else MODEL
     args.b = B if args.b is None else args.b
     args.observation_format = OBSERVATION_FORMAT
-    args.trust_env = TRUST_ENV if args.trust_env is None else args.trust_env
+    if args.trust_env is None:
+        args.trust_env = QWEN_TRUST_ENV if args.provider == "qwen" else TRUST_ENV
     if args.observation_format not in {"grid_3x3", "neighbor_counts"}:
         parser.error("OBSERVATION_FORMAT 必须为 grid_3x3 或 neighbor_counts")
     if type(args.trust_env) is not bool:
@@ -793,7 +932,10 @@ def main(argv=None):
 
     cases = build_cases(args.b, args.observation_format)
     total = len(cases) * args.n
-    print(f"模型={MODEL} | {describe_b(args.b)} | {len(cases)} 种组合 × {args.n} 次 = {total} 次独立请求", flush=True)
+    print(f"服务={args.provider} | 模型={model} | {describe_b(args.b)} | "
+          f"{len(cases)} 种组合 × {args.n} 次 = {total} 次独立请求", flush=True)
+    if args.provider == "qwen":
+        print(f"Qwen 思考强度={args.qwen_reasoning_effort}", flush=True)
     if args.dry_run:
         for index, case in enumerate(cases, 1):
             print(f"{index:3}. {describe_case(case)}，重复 {args.n} 次", flush=True)
@@ -803,18 +945,21 @@ def main(argv=None):
 
     try:
         import openai
-        api_key, base_url = load_config(DEFAULT_ENV_FILE)
+        api_key, base_url = load_provider_config(args.provider)
     except ImportError:
         print("缺少依赖，请运行：python -m pip install -r requirements.txt", file=sys.stderr)
         return 1
     except (ConfigError, OSError, UnicodeError, ValueError):
-        print("无法加载配置，请检查 API/gpt.env 中的密钥、地址和文件编码。", file=sys.stderr)
+        print(f"无法加载配置，请检查 {provider_metadata(args.provider)['env_file']} 中的密钥、地址和文件编码。",
+              file=sys.stderr)
         return 1
 
     started = datetime.now(LOG_TIMEZONE)
     batch_id = uuid4().hex
     directory = LOG_DIR / f"{started:%Y%m%d_%H%M%S_%f}_{batch_id}"
     summary = {
+        **provider_metadata(args.provider), "model": model,
+        "qwen_reasoning_effort": args.qwen_reasoning_effort,
         "batch_id": batch_id, "started_at": started.isoformat(timespec="milliseconds"),
         "finished_at": None, "status": "running", "b": args.b, "n": args.n,
         **b_metadata(args.b),
@@ -837,14 +982,18 @@ def main(argv=None):
             run_lock = lock_path
             lock.write(now())
         save_record(directory / "config.json", {
-            "batch_id": batch_id, "model": MODEL, "base_url": base_url, "b": args.b, "n": args.n,
+            **provider_metadata(args.provider),
+            "qwen_reasoning_effort": args.qwen_reasoning_effort,
+            "batch_id": batch_id, "model": model, "base_url": base_url, "b": args.b, "n": args.n,
             **b_metadata(args.b),
             "planned_requests": total, "system_prompt": SYSTEM_PROMPT, "cases": cases,
             "observation_format": args.observation_format, "case_count": len(cases),
             "trust_env": args.trust_env, "verify": True, "runtime": runtime_info(),
-            "requests": [make_request(case, args.max_tokens) for case in cases],
+            "requests": [make_request(case, args.max_tokens, args.provider,
+                                      qwen_reasoning_effort=args.qwen_reasoning_effort) for case in cases],
             "max_output_tokens": args.max_tokens, "timeout_seconds": args.timeout,
-            "max_retries": 0, "store": False, "continue_on_error": args.continue_on_error,
+            "max_retries": 0, "continue_on_error": args.continue_on_error,
+            **({"cache_prompt": False} if args.provider == "qwen" else {"store": False}),
             "tls_retries": args.tls_retries, "retry_delay_seconds": args.retry_delay,
             "order": ("每轮按行优先九格键枚举 C/D，保留全部旋转和镜像；共 n 轮；每次独立无历史。"
                       if args.observation_format == "grid_3x3" else
@@ -858,19 +1007,24 @@ def main(argv=None):
             writer = csv.DictWriter(output, fieldnames=CSV_FIELDS)
             writer.writeheader()
             output.flush()
+            progress_started = time.perf_counter()
+            print(format_progress(progress_started, 0, total), flush=True)
             for index in range(total):
                 case_index = index % len(cases)
                 repetition = index // len(cases) + 1
                 case = cases[case_index]
                 filename = f"records/{index + 1:06d}.json"
                 record = {
+                    **provider_metadata(args.provider),
                     "batch_id": batch_id, "request_index": index + 1,
                     "repetition": repetition, "combination_index": case_index + 1,
                     "observation": case, "base_url": base_url,
                     **b_metadata(args.b),
                     "client_options": {"timeout_seconds": args.timeout, "max_retries": 0,
                                        "trust_env": args.trust_env, "verify": True},
-                    "request": make_request(case, args.max_tokens), "api_call_started": False,
+                    "request": make_request(case, args.max_tokens, args.provider,
+                                            qwen_reasoning_effort=args.qwen_reasoning_effort),
+                    "api_call_started": False,
                     "started_at": now(), "finished_at": None, "duration_seconds": None,
                     "status": "running", "action": None, "output_text": None,
                     "response": None, "error": None,
@@ -897,7 +1051,10 @@ def main(argv=None):
                 output.flush()
                 save_record(directory / "summary.json", summary, api_key)
                 result = record["action"] if record["status"] == "success" else record["error"]["message"]
-                print(f"{result} ({record['duration_seconds']:.3f}s)", flush=True)
+                stopped = (record["status"] == "cancelled"
+                           or (record["status"] == "error" and not args.continue_on_error))
+                progress = format_progress(progress_started, index + 1, total, stopped=stopped)
+                print(f"{result} ({record['duration_seconds']:.3f}s) | {progress}", flush=True)
 
                 if record["status"] == "cancelled":
                     summary["status"], exit_code = "cancelled", 130
