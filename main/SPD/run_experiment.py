@@ -11,6 +11,7 @@
 REPEATS 控制每组参数运行多少次，单组和扫描模式均生效，也可传入 --repeats。
 NUM_WORKERS 控制并行进程数，也可传入 --workers；1 为串行，多个独立实验可并行。
 扫描子目录默认只保存 history.csv 和 final_grid.csv；SCAN_SAVE_DETAILS=True 可恢复完整记录。
+summary.csv 无法替换时保存备用 CSV 并继续；批次配置的 latest_summary_file 指向最新完整汇总。
 默认配对运行同初态、同资格位置的纯 Fermi 对照，在原有 CSV 中记录分组收益和配对差值。
 单值 --b/--k/--lambda/--p/--seed 只用于单组模式；扫描模式使用对应的 --*-values。
 
@@ -177,11 +178,13 @@ if __package__ in (None, ""):
     from SPD.simulation import SimulationConfig, SpatialPrisonersDilemma
     from SPD.experiment_metrics import PayoffTracker, GROUPS, HISTORY_FIELDS, SUMMARY_FIELDS
     from SPD.parallel_execution import ParallelRunError, run_parallel
+    from SPD.summary_writer import SummaryWriter
 else:
     from .llm_advisor import EmpiricalAdvisor, request_advice
     from .simulation import SimulationConfig, SpatialPrisonersDilemma
     from .experiment_metrics import PayoffTracker, GROUPS, HISTORY_FIELDS, SUMMARY_FIELDS
     from .parallel_execution import ParallelRunError, run_parallel
+    from .summary_writer import SummaryWriter
 
 
 GAIN_FIELDS = tuple(
@@ -599,6 +602,8 @@ def run_batch(args, configs, scan_values, advisors):
         "parallel_start_method": "spawn" if actual_workers > 1 else None,
         "completed_runs": 0,
         "completed_run_ids": [],
+        "latest_summary_file": "summary.csv",
+        "summary_pending": False,
         "failed_run_id": None,
         "status": "running",
     }
@@ -644,16 +649,13 @@ def run_batch(args, configs, scan_values, advisors):
         )))
 
     completed_rows = {}
+    summary_writer = SummaryWriter(output, fields)
 
     def save_summary():
         # 只有主进程写汇总；任务即使乱序完成，也按原run_id保存。
-        # 临时文件关闭后再替换，避免中断重写时损坏此前已完成的汇总。
-        temporary = output / "summary.csv.tmp"
-        with temporary.open("w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(completed_rows[run_id] for run_id in sorted(completed_rows))
-        temporary.replace(output / "summary.csv")
+        saved_path = summary_writer.save(completed_rows[run_id] for run_id in sorted(completed_rows))
+        metadata["latest_summary_file"] = saved_path.name
+        metadata["summary_pending"] = summary_writer.pending
 
     def on_result(run_id, summary):
         name = tasks[run_id - 1][1]["output"].name
@@ -695,7 +697,9 @@ def run_batch(args, configs, scan_values, advisors):
         raise
     finally:
         write_json(config_path, metadata)
-    print(f"{label}完成：{len(configs)} 次运行，结果见 {output / 'summary.csv'}", flush=True)
+    if summary_writer.pending:
+        print("summary.csv 尚未更新到最后结果，请使用下面的备用汇总文件。", flush=True)
+    print(f"{label}完成：{len(configs)} 次运行，结果见 {summary_writer.latest_path}", flush=True)
 
 
 def main(argv=None):

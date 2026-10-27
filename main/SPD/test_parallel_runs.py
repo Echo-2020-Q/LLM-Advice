@@ -318,6 +318,47 @@ class ParallelRunTests(unittest.TestCase):
         self.assertEqual([int(row["run_id"]) for row in read_csv(batch / "summary.csv")], [1])
         self.assertFalse((batch / "summary.csv.tmp").exists())
 
+    def test_locked_summary_keeps_spawn_batch_running_and_reports_complete_backup(self):
+        output = self.root / "locked_summary"
+        original_replace = Path.replace
+        original_primary = []
+        terminal = io.StringIO()
+
+        def deny_primary_updates(path, target):
+            target = Path(target)
+            if target.name == "summary.csv":
+                if target.exists():
+                    if not original_primary:
+                        original_primary.append(target.read_bytes())
+                    raise PermissionError("synthetic Windows summary.csv lock")
+            return original_replace(path, target)
+
+        arguments = self.scan_arguments(output, workers=2, details=False)
+        with patch.object(Path, "replace", deny_primary_updates), \
+                redirect_stdout(terminal), redirect_stderr(terminal):
+            self.assertEqual(runner.main(arguments), 0)
+
+        batch = next(output.glob("scan_*"))
+        metadata = read_json(batch / "scan_config.json")
+        self.assertEqual(metadata["status"], "completed")
+        self.assertEqual(metadata["completed_runs"], 8)
+        self.assertEqual(metadata["completed_run_ids"], list(range(1, 9)))
+        self.assertEqual(metadata["actual_workers"], 2)
+        self.assertEqual(metadata["parallel_start_method"], "spawn")
+        self.assertIsNone(metadata["failed_run_id"])
+        self.assertTrue(metadata["summary_pending"])
+        latest = batch / metadata["latest_summary_file"]
+        self.assertEqual(latest.name, "summary.pending.csv")
+        self.assertEqual([int(row["run_id"]) for row in read_csv(latest)], list(range(1, 9)))
+        self.assertEqual((batch / "summary.csv").read_bytes(), original_primary[0])
+        self.assertEqual(read_csv(batch / "summary.csv"), [])
+        self.assertFalse((batch / "summary.csv.tmp").exists())
+        for row in read_csv(latest):
+            self.assertTrue((batch / row["output_dir"] / "final_grid.csv").exists())
+        completion_lines = [line for line in terminal.getvalue().splitlines() if "结果见" in line]
+        self.assertEqual(len(completion_lines), 1)
+        self.assertIn(str(latest), completion_lines[0])
+
 
 if __name__ == "__main__":
     unittest.main()

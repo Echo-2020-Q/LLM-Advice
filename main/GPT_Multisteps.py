@@ -51,7 +51,7 @@ else:
 
 
 B = None  # None：b 的说明由 SYSTEM_PROMPT 提供；数值：在用户提示词中明确告知该值。
-N = 100 # 每个网格重复的次数；N=10 时共有 5120 次独立请求。
+N = 2 # 每个网格重复的次数；N=10 时共有 5120 次独立请求。
 OBSERVATION_FORMAT = "grid_3x3"  # 新批次使用完整 512 种网格；neighbor_counts 保留用于旧格式兼容。
 PROVIDER = "qwen"  # "gpt" 使用 API/gpt.env；"qwen" 使用 API/Qwen.env。
 QWEN_REASONING_EFFORT = "medium"  # 仅 Qwen："low"、"medium"、"xhigh"；新批次生效。
