@@ -143,6 +143,9 @@ class TestResume(unittest.TestCase):
         spec.loader.exec_module(cls.module)
 
     def setUp(self):
+        # 旧格式 GPT 批次测试独立于用户当前选择的默认模型服务。
+        self.patch_provider = patch.object(self.module, 'PROVIDER', 'gpt')
+        self.patch_provider.start()
         self.temp = tempfile.TemporaryDirectory(prefix='offline_resume_')
         self.root = Path(self.temp.name)
         self.patch_logs = patch.object(self.module, 'LOG_DIR', self.root / 'new_logs')
@@ -151,6 +154,7 @@ class TestResume(unittest.TestCase):
         self.patch_format.start()
 
     def tearDown(self):
+        self.patch_provider.stop()
         self.patch_format.stop()
         self.patch_logs.stop()
         self.temp.cleanup()

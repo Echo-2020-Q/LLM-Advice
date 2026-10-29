@@ -1,4 +1,4 @@
-"""LLM 服务选择及本地 Qwen 的 Chat Completions 适配；导入不会读取密钥或联网。"""
+"""LLM 服务选择及 Qwen/DeepSeek 的 Chat Completions 适配；导入不会读取密钥或联网。"""
 
 import re
 import shlex
@@ -11,14 +11,17 @@ else:
     from GPT_test import APIError as ConfigError
 
 
-PROVIDERS = ("gpt", "qwen")
+PROVIDERS = ("gpt", "qwen", "deepseek")
 QWEN_MODEL = "/home/tianyuxuan/qwen/Qwen3.8-27B-f16.gguf"
 QWEN_REASONING_EFFORTS = ("low", "medium", "xhigh")
+# 4Router 公开模型目录：https://4router.net/api/pricing（与 DeepSeek 官方模型别名不同）。
+DEEPSEEK_MODEL = "deepseek-v4.1-flash"
+DEEPSEEK_BASE_URL = "https://4router.net/v1"
 
 
 def normalize_provider(provider):
     if not isinstance(provider, str) or provider.strip().lower() not in PROVIDERS:
-        raise ValueError("PROVIDER 必须为 'gpt' 或 'qwen'。")
+        raise ValueError("PROVIDER 必须为 'gpt'、'qwen' 或 'deepseek'。")
     return provider.strip().lower()
 
 
@@ -29,13 +32,22 @@ def normalize_qwen_reasoning_effort(value):
 
 
 def provider_env_file(provider):
-    name = "Qwen.env" if normalize_provider(provider) == "qwen" else "gpt.env"
+    name = {"gpt": "gpt.env", "qwen": "Qwen.env", "deepseek": "Deepseek4.1flash"}[normalize_provider(provider)]
     return Path(__file__).resolve().parents[1] / "API" / name
 
 
 def load_qwen_config():
     """只读取 Qwen.env，不回退到 GPT 配置、默认远程地址或进程环境变量。"""
-    path = provider_env_file("qwen")
+    return _load_chat_config("qwen")
+
+
+def load_deepseek_config():
+    """只读取 API/Deepseek4.1flash，默认使用用户指定的 4Router 平台。"""
+    return _load_chat_config("deepseek", default_url=DEEPSEEK_BASE_URL)
+
+
+def _load_chat_config(provider, *, default_url=""):
+    path = provider_env_file(provider)
     if not path.is_file():
         raise ConfigError(f"找不到配置文件：{path}")
     values = {}
@@ -45,19 +57,21 @@ def load_qwen_config():
             continue
         match = re.fullmatch(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)", line)
         if not match:
-            raise ConfigError(f"Qwen.env 第 {number} 行格式错误，应为 KEY=value。")
+            raise ConfigError(f"{path.name} 第 {number} 行格式错误，应为 KEY=value。")
         try:
             parts = shlex.split(match[2], comments=True)
         except ValueError:
-            raise ConfigError(f"Qwen.env 第 {number} 行引号未闭合。") from None
+            raise ConfigError(f"{path.name} 第 {number} 行引号未闭合。") from None
         if len(parts) > 1:
-            raise ConfigError(f"Qwen.env 第 {number} 行的值包含空格，请使用引号。")
+            raise ConfigError(f"{path.name} 第 {number} 行的值包含空格，请使用引号。")
         values[match[1]] = parts[0] if parts else ""
-    key = (values.get("GPT_API_KEY") or values.get("OPENAI_API_KEY") or "").strip()
+    key = ((values.get("DEEPSEEK_API_KEY") if provider == "deepseek" else None)
+           or values.get("GPT_API_KEY") or values.get("OPENAI_API_KEY") or "").strip()
     if not key or any(char.isspace() for char in key):
-        raise ConfigError("请在 Qwen.env 中设置不含空白字符的 GPT_API_KEY。")
-    url = (values.get("base_url") or values.get("GPT_BASE_URL")
-           or values.get("OPENAI_BASE_URL") or "").strip().rstrip("/")
+        raise ConfigError(f"请在 {path.name} 中设置不含空白字符的 GPT_API_KEY。")
+    url = (values.get("base_url")
+           or (values.get("DEEPSEEK_BASE_URL") if provider == "deepseek" else None)
+           or values.get("GPT_BASE_URL") or values.get("OPENAI_BASE_URL") or default_url).strip().rstrip("/")
     try:
         parsed = urlsplit(url)
         valid = (parsed.scheme in {"http", "https"} and bool(parsed.hostname)
@@ -67,7 +81,7 @@ def load_qwen_config():
     except ValueError:
         valid = False
     if not valid:
-        raise ConfigError("请在 Qwen.env 中设置有效的 HTTP/HTTPS base_url，例如 http://localhost:8080/v1。")
+        raise ConfigError(f"请在 {path.name} 中设置有效的 HTTP/HTTPS base_url。")
     return key, url
 
 
@@ -88,6 +102,19 @@ def build_qwen_request(system_prompt, user_prompt, *, model=QWEN_MODEL, max_toke
         # llama.cpp 扩展参数：关闭提示缓存，分离推理与最终正文；采样参数沿用服务端默认值。
         # None 不发送思考强度，以便复现添加该选项之前保存的批次请求。
         "extra_body": extra_body,
+    }
+
+
+def build_deepseek_request(system_prompt, user_prompt, *, model=DEEPSEEK_MODEL, max_tokens=10240):
+    """独立 Chat Completions 咨询；不传历史或本地 llama.cpp 的专用参数。"""
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": max_tokens,
+        "stream": False,
     }
 
 

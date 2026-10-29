@@ -1,14 +1,15 @@
-"""使用 GPT-5.5 或本地 Qwen 进行空间囚徒困境决策咨询。
+"""使用 GPT-5.5、本地 Qwen 或 DeepSeek 进行空间囚徒困境决策咨询。
 
 安装依赖：python -m pip install -r requirements.txt
 在项目目录运行：python main/GPT_onestep_test.py
 直接修改 USER_PROMPT 和 USER_PROMPT_2 中的 3×3 C/D 网格；中心是第 2 行第 2 列。
 SINGLE_QUESTION=True 时只询问 USER_PROMPT；False 时依次询问 USER_PROMPT 和 USER_PROMPT_2。
-每次只为中心个体输出 C 或 D。GPT 首轮发送 SYSTEM_PROMPT；Qwen 每轮都发送。
+每次只为中心个体输出 C 或 D。GPT 首轮发送 SYSTEM_PROMPT；Qwen/DeepSeek 每轮都发送。
 PROVIDER="gpt" 读取 API/gpt.env；"qwen" 读取 API/Qwen.env，也可用 --provider qwen 选择。
+PROVIDER="deepseek" 读取 API/Deepseek4.1flash，也可用 --provider deepseek 选择。
 QWEN_REASONING_EFFORT 默认 medium，可改为 low/medium/xhigh，或用 --qwen-reasoning-effort 覆盖。
 GPT 多轮模式通过 previous_response_id 续接，共用 HTTP 客户端，依赖平台响应存储。
-Qwen 每轮只发送当前 SYSTEM_PROMPT 和 USER_PROMPT，独立新建客户端，用完关闭，不继承历史。
+Qwen/DeepSeek 每轮只发送当前 SYSTEM_PROMPT 和 USER_PROMPT，独立新建客户端，用完关闭，不继承历史。
 第二张网格由你填写，不由第一轮建议自动演化。最多发送一或两次请求，可能产生 API 费用。
 各轮的输入、输出和状态逐轮保存到 logs/GPT_onestep_test/ 下同一个独立 JSON 文件。
 错误写入 stderr，并以非零状态退出；失败时停止，不自动重试。
@@ -31,20 +32,22 @@ from uuid import uuid4
 
 if __package__:
     from .GPT_test import APIError as ConfigError, DEFAULT_ENV_FILE, load_config
-    from .llm_provider import (PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS,
-                               build_qwen_request, chat_response_record, load_qwen_config,
+    from .llm_provider import (DEEPSEEK_MODEL, PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS,
+                               build_deepseek_request, build_qwen_request, chat_response_record,
+                               load_deepseek_config, load_qwen_config,
                                normalize_provider, normalize_qwen_reasoning_effort, provider_env_file,
                                validate_chat_response)
 else:
     from GPT_test import APIError as ConfigError, DEFAULT_ENV_FILE, load_config
-    from llm_provider import (PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS,
-                              build_qwen_request, chat_response_record, load_qwen_config,
+    from llm_provider import (DEEPSEEK_MODEL, PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS,
+                              build_deepseek_request, build_qwen_request, chat_response_record,
+                              load_deepseek_config, load_qwen_config,
                               normalize_provider, normalize_qwen_reasoning_effort, provider_env_file,
                               validate_chat_response)
 
 
-PROVIDER = "gpt"  # "gpt"：API/gpt.env；"qwen"：API/Qwen.env。
-MODEL = "gpt-5.5"  # GPT 使用此模型；Qwen 使用 llm_provider.py 中的 QWEN_MODEL。
+PROVIDER = "gpt"  # "gpt"：API/gpt.env；"qwen"：API/Qwen.env；"deepseek"：API/Deepseek4.1flash。
+MODEL = "gpt-5.5"  # GPT 使用此模型；Qwen/DeepSeek 使用 llm_provider.py 中各自的模型常量。
 SINGLE_QUESTION = True  # True：只问 USER_PROMPT；False：连续问 USER_PROMPT 和 USER_PROMPT_2。
 MAX_OUTPUT_TOKENS = 10240  # 推理和最终回答共用此上限；1024 曾在推理阶段耗尽。
 TIMEOUT_SECONDS = 120
@@ -107,7 +110,7 @@ What action would you recommend for the center player in the next round to maxim
 Return only one action: C or D."""
 
 # 示例 2：与上面仅左上角不同；中心仍为 C，四个直接邻居的位置和策略均相同。
-# 可单独编辑；GPT 第二次带有第一轮上下文，Qwen 每次独立咨询。
+# 可单独编辑；GPT 第二次带有第一轮上下文，Qwen/DeepSeek 每次独立咨询。
 USER_PROMPT_2 = """Game state:
 
 Current local 3x3 grid (C = Cooperate, D = Defect):
@@ -139,7 +142,7 @@ class RunError(Exception):
 
 
 def selected_qwen_reasoning_effort(provider, value=None):
-    """选择当前 Qwen 强度，不修改模块配置，也不改变 GPT 请求。"""
+    """选择当前 Qwen 强度，不修改模块配置，也不改变其他服务的请求。"""
     if provider != "qwen":
         if value is not None:
             raise ValueError("Qwen 思考强度只适用于 provider=qwen。")
@@ -150,9 +153,13 @@ def selected_qwen_reasoning_effort(provider, value=None):
 def build_request(user_prompt, *, previous_response_id=None, provider=None, qwen_reasoning_effort=None):
     provider = normalize_provider(PROVIDER if provider is None else provider)
     effort = selected_qwen_reasoning_effort(provider, qwen_reasoning_effort)
-    if provider == "qwen":
+    if provider in {"qwen", "deepseek"}:
         if previous_response_id is not None:
-            raise ValueError("Qwen 使用独立咨询，不能传入 previous_response_id。")
+            label = "Qwen" if provider == "qwen" else "DeepSeek"
+            raise ValueError(f"{label} 使用独立咨询，不能传入 previous_response_id。")
+        if provider == "deepseek":
+            return build_deepseek_request(SYSTEM_PROMPT, user_prompt, model=DEEPSEEK_MODEL,
+                                          max_tokens=MAX_OUTPUT_TOKENS)
         return build_qwen_request(SYSTEM_PROMPT, user_prompt, model=QWEN_MODEL,
                                   max_tokens=MAX_OUTPUT_TOKENS, reasoning_effort=effort)
     messages = [{"role": "user", "content": user_prompt}]
@@ -266,7 +273,7 @@ def ask_advisor(client, user_prompt=USER_PROMPT, *, record=None, previous_respon
     if record is not None:
         record["request"] = request
         record["api_call_started"] = True
-    if provider == "qwen":
+    if provider in {"qwen", "deepseek"}:
         response = client.chat.completions.create(**request)
         if record is not None:
             record["output_text"], record["response"] = chat_response_record(response)
@@ -306,7 +313,7 @@ def ask_advisor(client, user_prompt=USER_PROMPT, *, record=None, previous_respon
 
 
 def create_client(api_key, base_url, *, provider=None):
-    """创建客户端：GPT 连续对话共享；Qwen 每轮创建并关闭。"""
+    """创建客户端：GPT 连续对话共享；Qwen/DeepSeek 每轮创建并关闭。"""
     from openai import DefaultHttpxClient, OpenAI
 
     provider = normalize_provider(PROVIDER if provider is None else provider)
@@ -334,11 +341,12 @@ def run_advisor(api_key, base_url, record, *, user_prompt=USER_PROMPT, previous_
     from openai import APIConnectionError, APIStatusError, APITimeoutError
     from openai import APIError as SDKError
 
-    if provider == "qwen" and previous_response_id is not None:
-        raise ValueError("Qwen 使用独立咨询，不能传入 previous_response_id。")
+    if provider in {"qwen", "deepseek"} and previous_response_id is not None:
+        label = "Qwen" if provider == "qwen" else "DeepSeek"
+        raise ValueError(f"{label} 使用独立咨询，不能传入 previous_response_id。")
     try:
-        # Qwen 即使收到外部 client，也由本轮独立创建/关闭客户端，避免共享 Cookie 或会话。
-        if provider == "qwen":
+        # Qwen/DeepSeek 即使收到外部 client，也由本轮创建/关闭客户端，避免共享 Cookie 或会话。
+        if provider in {"qwen", "deepseek"}:
             with create_client(api_key, base_url, provider=provider) as standalone_client:
                 return ask_advisor(standalone_client, user_prompt, record=record, provider=provider,
                                    qwen_reasoning_effort=effort)
@@ -396,8 +404,9 @@ def run_advisor(api_key, base_url, record, *, user_prompt=USER_PROMPT, previous_
             429: "请求受限或额度不足。",
         }
         hint = hints.get(exc.status_code, "请检查平台服务状态。")
-        if provider == "qwen" and exc.status_code in {400, 404}:
-            hint = "请检查 Qwen 的 Chat Completions 接口、模型名称和请求参数。"
+        if provider in {"qwen", "deepseek"} and exc.status_code in {400, 404}:
+            label = "Qwen" if provider == "qwen" else "DeepSeek"
+            hint = f"请检查 {label} 的 Chat Completions 接口、模型名称和请求参数。"
         if exc.status_code == 400 and previous_response_id is not None:
             hint = "平台拒绝了带 previous_response_id 的续接请求，请根据日志中的服务端详情定位原因。"
         raise RunError(
@@ -428,7 +437,7 @@ def main(provider=None, qwen_reasoning_effort=None):
         "provider": provider,
         "qwen_reasoning_effort": effort,
         "env_file": str(env_file),
-        "api_interface": "chat.completions" if provider == "qwen" else "responses",
+        "api_interface": "responses" if provider == "gpt" else "chat.completions",
         "client_options": {"timeout_seconds": TIMEOUT_SECONDS, "max_retries": 0,
                            "trust_env": QWEN_TRUST_ENV if provider == "qwen" else TRUST_ENV,
                            "shared_across_turns": provider == "gpt"},
@@ -439,7 +448,7 @@ def main(provider=None, qwen_reasoning_effort=None):
         "response": None,
         "error": None,
         "single_question": SINGLE_QUESTION,
-        "conversation_mode": ("independent_turns" if provider == "qwen" else
+        "conversation_mode": ("independent_turns" if provider in {"qwen", "deepseek"} else
                               "single_turn" if SINGLE_QUESTION else "previous_response_id"),
         "planned_turns": len(user_prompts),
         "completed_turns": 0,
@@ -467,10 +476,15 @@ def main(provider=None, qwen_reasoning_effort=None):
 
     try:
         record["runtime"] = runtime_info()
-        api_key, base_url = load_qwen_config() if provider == "qwen" else load_config(DEFAULT_ENV_FILE)
+        if provider == "qwen":
+            api_key, base_url = load_qwen_config()
+        elif provider == "deepseek":
+            api_key, base_url = load_deepseek_config()
+        else:
+            api_key, base_url = load_config(DEFAULT_ENV_FILE)
         record["base_url"] = base_url
         previous_response_id = None
-        # GPT 保存原有连续会话逻辑；Qwen 的 run_advisor 每轮负责新建和关闭独立客户端。
+        # GPT 保存原有连续会话逻辑；Qwen/DeepSeek 每轮负责新建和关闭独立客户端。
         context = create_client(api_key, base_url, provider=provider) if provider == "gpt" else nullcontext(None)
         with context as client:
             for turn_number, user_prompt in enumerate(record["user_prompts"], start=1):
@@ -676,7 +690,7 @@ def cli(argv=None):
     parser = argparse.ArgumentParser(description="按 SINGLE_QUESTION 设置进行一次或两轮决策咨询，或只查询已有响应记录。")
     parser.add_argument("--check-response", metavar="LOG_FILE", help="只查询日志中的第一轮响应，不生成新回答")
     parser.add_argument("--provider", type=normalize_provider, choices=PROVIDERS, default=None,
-                        help="gpt 读取 API/gpt.env；qwen 读取 API/Qwen.env，每轮独立咨询")
+                        help="gpt 读取 API/gpt.env；qwen 读取 API/Qwen.env；deepseek 读取 API/Deepseek4.1flash；后两者每轮独立咨询")
     parser.add_argument("--qwen-reasoning-effort", type=normalize_qwen_reasoning_effort,
                         choices=QWEN_REASONING_EFFORTS, default=None,
                         help="仅 Qwen：思考强度 low/medium/xhigh，默认读取 QWEN_REASONING_EFFORT")
@@ -690,7 +704,7 @@ def cli(argv=None):
         if args.qwen_reasoning_effort is not None:
             parser.error("--qwen-reasoning-effort 不能用于 --check-response。")
         if provider != "gpt":
-            parser.error("--check-response 仅适用于 GPT Responses；Qwen 不存储可续接的响应。")
+            parser.error("--check-response 仅适用于 GPT Responses；Qwen/DeepSeek 使用独立咨询。")
         return check_response_log(args.check_response)
     return main(provider=provider, qwen_reasoning_effort=effort)
 

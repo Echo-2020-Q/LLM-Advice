@@ -1,14 +1,65 @@
-空间囚徒困境：资格组收益与纯 Fermi 配对对照
+空间囚徒困境：动态信任、资格组收益与纯 Fermi 配对对照
 
 运行设置（直接修改 run_experiment.py）
   PAIRED_FERMI_CONTROL = True：每次实验另运行一条纯 Fermi 对照轨迹。
   INITIAL_COOPERATION = 0.5：各位置以 50% 概率初始化为 C。
-  P = 0.2 / SCAN_P_VALUES = [P]：固定选定 20% 位置具有建议资格。
-  SCAN_LAMBDA_VALUES = [0, 0.1, 0.5, 1]：扫描固定采纳概率。
+  P / SCAN_P_VALUES：初始化时固定选定的建议资格比例，例如 P=0.2 表示20%位置。
+  ADVICE_MODE = "adaptive"：默认动态信任；"fixed" 保留原来的固定采纳概率机制。
+  INITIAL_TRUST = 0.5：动态模式资格者的初始信任 T0，也是第一次决策的采纳概率。
+  TRUST_LEARNING_RATE = 0.1：信任更新速度 α，范围[0,1]。
+  ASPIRATION_LEARNING_RATE = 0.1：参考收益平滑速度 β，范围[0,1]。
+  TRUST_PAYOFF_WINDOW = 3：信任学习使用最近3个已完成回合的个人平均收益，包含刚结束的本轮。
+  可用 --trust-payoff-window 覆盖，必须为正整数；设为1恢复原来的单轮收益反馈。
+  动态模式用 T_i(t) 直接作为采纳概率，不再乘 LAMBDA_PROB。
+  SCAN_INITIAL_TRUST_VALUES / SCAN_TRUST_LEARNING_RATES / SCAN_ASPIRATION_LEARNING_RATES
+  分别扫描初始信任、α、β；默认列表各只有对应设置的一个值。
+  固定模式才使用 LAMBDA_PROB / SCAN_LAMBDA_VALUES，含义仍是每次决策的采纳概率。
   REPEATS：每组参数的独立重复次数；不同重复使用不同种子。
   NUM_WORKERS = 4：最多同时运行4次实验；设为1恢复串行，也可用 --workers 覆盖。
   EARLY_AVERAGE_STEPS / TAIL_AVERAGE_STEPS：前期、末期窗口长度。
-  这些实验的 λ 保持固定，本次尚未实现个体按收益自适应调整 λ。
+  动态模式第一版只支持 UPDATE_MODE="synchronous"，所有位置同时决策与结算反馈。
+
+动态信任的时序与含义
+  初始化：每个位置的参考收益 A_i(0) 等于该位置在初始策略网格中的四邻居收益。
+  第t+1轮：先根据旧网格观测、旧信任 T_i(t) 与旧参考收益 A_i(t) 决策。
+  资格者以概率 T_i(t) 请求并采纳本地建议；否则执行原有 Fermi 模仿。
+  无资格者始终执行 Fermi；资格位置不会随策略模仿转移。
+  采用建议即记 m_i(t)=1，包括建议与原策略相同的情况。
+  建议返回 None、实际回退 Fermi 时记 m_i(t)=0，不给信任提供反馈。
+  全部新策略统一执行后，计算新网格的实际四邻居收益 π_i(t+1)。
+  然后计算个人滚动平均 r_i(t+1)：最近W个已完成回合的原始收益平均，包含本轮。
+  初态π_i(0)仅初始化A0，不加入滚动窗口；每轮收益均入窗，包括未采纳的回合。
+  W=3时，第1轮r=π(1)，第2轮r=[π(1)+π(2)]/2，第3轮r=[π(1)+π(2)+π(3)]/3，
+  第4轮r=[π(2)+π(3)+π(4)]/3。各个体保存自己的历史，不对邻居或全体做时间平均。
+  必须先计算 Δ_i(t)=r_i(t+1)-A_i(t)，这里用更新前的参考收益。
+  仅 m=1 时，Δ>0 则 T←T+α(1-T)，Δ<0 则 T←(1-α)T；Δ=0保持。
+  未采纳时信任保持；不设反馈容差，也不按收益差幅度加权。
+  最后所有位置每轮都更新 A←(1-β)A+βr，包括未采纳和无资格位置。
+  因此先做W轮等权平均，再通过β更新个人参考；β=1时下一轮基准就是刚结束的W轮均值。
+  β=0时一直使用初始参考收益。Fermi模仿及现有收益/累计福利仍使用原始当前收益。
+  将多轮均值归给本轮采纳是模型的满意度反馈设定，不能视为本轮建议的单独因果效果。
+  α=0 时动态模式采纳概率始终为 T0，可作为固定采纳率的机制核对。
+  初始信任 T0=0 将不会主动获得新反馈，T0=1 也不保证后续一直为1。
+  不设置探索概率下限；信任很低时，获得新建议反馈的机会随之减少，可能长期停用。
+  持续相同收益若仍高于/低于历史参考，也会持续给同方向反馈，直到数值上相等。
+  因而应把该指标解释为基于收益满意度的经验信任，不解释为收益提升幅度的估计。
+
+三组比较
+  建议比较纯 Fermi、固定概率T0、从同一T0出发的动态信任三个机制。
+  动态实验默认已配对一条纯 Fermi 轨迹，但不会自动额外运行固定概率实验组。
+  可在 main/SPD 目录运行下列两批扫描；其他参数、扫描列表与种子保持相同：
+    python run_experiment.py --scan --advice-mode adaptive --initial-trust-values 0.5
+    python run_experiment.py --scan --advice-mode fixed --lambda-values 0.5
+  第一批扫描动态信任参数，第二批扫描固定采纳率；每批保留各自的纯 Fermi 配对。
+  单组实验则用 --single --advice-mode adaptive --initial-trust 0.5，或
+  --single --advice-mode fixed --lambda 0.5；可再用 --b、--k、--p、--seed 覆盖单组设置。
+  α与β的单值命令为 --trust-learning-rate、--aspiration-learning-rate，
+  扫描命令为 --trust-learning-rate-values、--aspiration-learning-rate-values。
+  动态模式显式传 --lambda / --lambda-values 会报错，避免误以为两个概率相乘。
+  动态模式summary.csv的lambda_prob列为空；请按advice_mode及三项信任参数识别实验组。
+  config.json内部旧lambda_prob使用0占位，不表示动态模式关闭建议。
+  比较两批时按b、K、P、种子等共同参数匹配，使用相同初始策略和固定资格位置。
+  同种子、同参数的纯 Fermi 轨迹只是重复的对照数据，不能计为更多独立重复。
 
 多核运行
   扫描和单组重复实验均可并行；实际进程数为 min(NUM_WORKERS, 总运行次数)。
@@ -27,7 +78,7 @@
 
 LLM 策略表与观察窗口
   LLM_BATCH_DIR 指向本地批次，按 config.json 的 observation_format 自动识别输入格式。
-  当前默认批次是 20261016_173605_322949_5d224b193871427f8c133150d99a6599。
+  当前默认目录是 20261016_173605_GPT5.5，batch_id仍是5d224b193871427f8c133150d99a6599。
   grid_3x3：512种完整3×3布局。按北到南、西到东逐行拼接为9字符 grid_key，
   中心（第5个字符）是本人，四个角提供额外观察；不合并旋转、镜像或相同邻居计数。
   同步更新从该轮共同旧状态取窗；异步更新从当前事件前的状态取窗。
@@ -40,7 +91,7 @@ LLM 策略表与观察窗口
   两种本地表目前都要求周期边界；缺失局面或失败回答会在运行前报错。
 
 配对方式
-  每个参数组合、每个重复均有自己的对照；仅将对照 λ 改为 0。
+  每个参数组合、每个重复均有自己的对照；对照显式使用 fixed 模式并将 λ 设为0。
   b、K、更新方式、边界、种子、初始策略网格、固定资格位置和总步数都相同。
   资格组在对照中仍表示同一批位置，但这些位置完全执行 Fermi 更新。
   两条轨迹各自持有随机数状态。干预后随机数消费顺序可能不同，
@@ -57,7 +108,7 @@ LLM 策略表与观察窗口
 文件
   扫描根目录 summary.csv：每行是一组参数的一次重复，包含两条轨迹的汇总与差值。
   扫描根目录 scan_config.json：设置、建议来源和 statistics_semantics 指标说明。
-  每个子目录 history.csv：原逐轮指标 + 分组收益 + 对照 + 差值，按 round 对齐。
+  每个子目录 history.csv：原逐轮指标 + 信任/反馈统计 + 分组收益 + 对照 + 差值，按 round 对齐。
   每个子目录 final_grid.csv：建议实验的最终网格。
   精简模式不额外生成对照子目录。单组模式的汇总在 config.json 的 summary 内。
 
@@ -72,6 +123,23 @@ history.csv 的新增收益字段（把 g 换成上面的任一组名）
   g_cumulative_mean_payoff：截至该轮，组内每人累计收益的平均值。
   每项还有 control_ 和 delta_ 版本；同一行严格对应同一个完整步。
 
+history.csv 的信任与反馈字段
+  eligible_trust_mean / std / min / max：资格者的信任均值、总体标准差、最小值、最大值。
+  eligible_low_trust_fraction / eligible_high_trust_fraction：资格者中 T<0.1 / T>0.9 的比例。
+  eligible_trust_bin_0..9：资格者信任的10档比例，[0,0.1)、[0.1,0.2)、…、[0.9,1]。
+  边界T=1归入最后一档；低/高信任比例采用严格小于/大于，不包含0.1/0.9本身。
+  eligible_aspiration_mean：资格者轮末参考收益的均值，收益单位仍是四邻居收益之和。
+  eligible_feedback_payoff_mean：资格者各自最近W轮收益平均的组内均值，实际用于本轮信任学习。
+  round0或fixed模式时该反馈收益列为空；原有average_payoff仍是本轮瞬时收益的全体均值。
+  eligible_advice_rate：本轮实际成功采纳次数 / 本轮资格者决策次数；同步时分母为资格人数。
+  trust_positive_feedback / trust_negative_feedback / trust_zero_feedback：本轮实际采纳后的
+  正、负、零反馈人数；三者相加等于动态模式本轮实际采纳次数。
+  row=t的信任与参考收益是第t轮反馈更新后的值，将用于第t+1轮决策；
+  同一行的采纳比例和反馈次数描述刚结束的第t轮，不能用该行更新后的信任验证采纳期望。
+  round=0显示初始信任与参考收益，但没有实际决策，采纳比例为空、反馈次数为0。
+  固定模式不定义动态信任/参考收益，相关列为空、信任反馈次数为0；实际采纳比例仍记录。
+  P=0没有资格者时，信任分布、人均参考收益和采纳比例均为空，反馈次数为0。
+
 summary.csv 的收益字段
   g_count：该组人数。
   g_cumulative_total_payoff：该组所有位置、所有观测步的收益总和。
@@ -82,6 +150,23 @@ summary.csv 的收益字段
   control_ 包含上述所有指标；delta_ 提供人均累计、全程/前期/末期均值的配对差值。
   time_mean_cooperation_rate：round1..T 的平均合作率，另有 control_、delta_。
   原有 final_* / tail_mean_* 结果保留，并提供相应 control_、delta_。
+
+summary.csv 的信任与反馈字段
+  initial_eligible_trust_mean：资格者的初始平均信任；不把初态计入全程/早期/末期均值。
+  final_eligible_trust_mean / std / min / max、final_eligible_low_trust_fraction、
+  final_eligible_high_trust_fraction、final_eligible_trust_bin_0..9、
+  final_eligible_aspiration_mean：最后观测状态的资格者信任与参考收益统计。
+  final_eligible_feedback_payoff_mean：最后一轮实际用于信任学习的资格者平均反馈收益。
+  trust_payoff_window：该次实验的收益窗口长度；批次配置fixed_parameters中也记录此值。
+  time_mean_eligible_trust / early_mean_eligible_trust / tail_mean_eligible_trust：
+  round1..T、早期窗口、末期窗口内轮末平均信任的时间平均。
+  time_mean_eligible_advice_rate / early_mean_eligible_advice_rate / tail_mean_eligible_advice_rate：
+  相同三个时间窗口内实际采纳比例的时间平均，固定模式也有这些指标。
+  total_trust_positive_feedback / total_trust_negative_feedback / total_trust_zero_feedback：
+  round1..T累计反馈次数；固定模式为0。
+  STEPS=0时仍报告动态模式的初始/最终信任，但所有信任/采纳比例的时间均值为空。
+  信任仅在资格者中汇总，不以无资格者的0信任稀释平均数。
+  纯 Fermi 对照属于 fixed 模式，没有动态信任可比；不计算信任的control_或delta_差值。
 
 窗口与空值
   observed_steps / early_observed_steps / tail_observed_steps 是实际样本步数。
@@ -109,5 +194,8 @@ summary.csv 的收益字段
   用 delta_eligible_early_mean_payoff 与 delta_eligible_tail_mean_payoff 判断优势是否延续，
   并结合 history.csv 的逐轮曲线，而不只查看最后一步。
   差值包含邻域传播效应，不能解释为一次咨询的纯直接效应。
+  信任的正反馈只说明采纳后的收益高于自己的旧参考；负反馈也可能来自邻居同时改策略。
+  因此正/负反馈不是建议的因果优劣标签，要结合配对收益优势和合作率一起分析。
+  固定概率组与动态信任组的比较，回答收益变化是否与个体逐渐增加/停止采纳有关。
   多次重复时先计算每个种子的配对差值，再按参数组合比较均值和离散程度。
   格点、时间步、不同 λ 重用的同一条 Fermi 基线不作为额外独立重复。

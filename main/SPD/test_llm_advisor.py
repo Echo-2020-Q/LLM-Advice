@@ -282,7 +282,7 @@ class ExperimentIntegrationTests(BatchFixtureTests):
                 "--advisor-batch", str(self.batch), "--output-dir", str(self.root / "outputs")]
         with mock.patch.multiple(run_experiment, P=1.0, BOUNDARY="periodic", UPDATE_MODE="synchronous",
                                  INITIAL_COOPERATION=0.5, SEED=42, SCAN_SEEDS=None, SCAN_SAVE_DETAILS=True,
-                                 PAIRED_FERMI_CONTROL=False, NUM_WORKERS=1), \
+                                 PAIRED_FERMI_CONTROL=False, NUM_WORKERS=1, ADVICE_MODE="fixed"), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return run_experiment.main(argv + list(arguments))
 

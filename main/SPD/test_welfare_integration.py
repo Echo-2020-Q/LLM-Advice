@@ -59,6 +59,9 @@ class WelfareIntegrationTests(unittest.TestCase):
         workers = patch.object(runner, "NUM_WORKERS", 1)
         workers.start()
         self.addCleanup(workers.stop)
+        advice_mode = patch.object(runner, "ADVICE_MODE", "fixed")
+        advice_mode.start()
+        self.addCleanup(advice_mode.stop)
 
     def run_case(self, name, config, steps, paired=True, early=2, tail=2):
         advisor = AlternatingAdvisor()

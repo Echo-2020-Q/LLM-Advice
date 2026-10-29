@@ -1,14 +1,17 @@
-"""独立重复咨询 GPT 或 Qwen：全部 512 种 3×3 C/D 网格，每种重复 n 次。
+"""独立重复咨询 GPT、Qwen 或 DeepSeek：全部 512 种 3×3 C/D 网格，每种重复 n 次。
 
 中心是第 2 行第 2 列，上下左右为直接邻居，四角提供空间信息。
 每次请求只包含系统指令和当前网格，没有历史；不合并旋转或镜像图案。
 B=None 时不在用户提示词中添加 b 的说明；请自行在 SYSTEM_PROMPT 中填写。
 运行：python main/GPT_Multisteps.py --n 10
 选择 Qwen：python main/GPT_Multisteps.py --provider qwen --n 10
+选择 DeepSeek：python main/GPT_Multisteps.py --provider deepseek --n 10
 Qwen 思考强度：文件顶部 QWEN_REASONING_EFFORT，或 --qwen-reasoning-effort medium。
 可选 low、medium、xhigh；续跑保留原批次强度，改变强度请创建新批次。
 PROVIDER="gpt" 读取 API/gpt.env；"qwen" 读取 API/Qwen.env。
+PROVIDER="deepseek" 读取 API/Deepseek4.1flash，使用 4Router 的 deepseek-v4.1-flash。
 Qwen 每次仅发送系统提示词和当前网格，关闭提示词缓存，请求结束后关闭客户端。
+DeepSeek 每次也仅发送当前系统提示词和网格，独立创建并关闭客户端，不带历史。
 仅预览：python main/GPT_Multisteps.py --n 10 --dry-run
 如需明确给出某个数值，仍可指定 --b 1.5。
 旧式十组合批次仍可通过 --resume 续跑，沿用保存的原始提示词。
@@ -37,26 +40,28 @@ from uuid import uuid4
 if __package__:
     from .GPT_test import APIError as ConfigError, DEFAULT_ENV_FILE, load_config
     from .GPT_onestep_test import LOG_TIMEZONE, exception_diagnostics, redact, runtime_info, save_record
-    from .llm_provider import (PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS,
-                               build_qwen_request, chat_response_record, load_qwen_config,
+    from .llm_provider import (PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS, DEEPSEEK_MODEL,
+                               build_qwen_request, build_deepseek_request, chat_response_record,
+                               load_qwen_config, load_deepseek_config,
                                normalize_provider, normalize_qwen_reasoning_effort,
                                provider_env_file, validate_chat_response)
 else:
     from GPT_test import APIError as ConfigError, DEFAULT_ENV_FILE, load_config
     from GPT_onestep_test import LOG_TIMEZONE, exception_diagnostics, redact, runtime_info, save_record
-    from llm_provider import (PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS,
-                              build_qwen_request, chat_response_record, load_qwen_config,
+    from llm_provider import (PROVIDERS, QWEN_MODEL, QWEN_REASONING_EFFORTS, DEEPSEEK_MODEL,
+                              build_qwen_request, build_deepseek_request, chat_response_record,
+                              load_qwen_config, load_deepseek_config,
                               normalize_provider, normalize_qwen_reasoning_effort,
                               provider_env_file, validate_chat_response)
 
 
 B = None  # None：b 的说明由 SYSTEM_PROMPT 提供；数值：在用户提示词中明确告知该值。
-N = 2 # 每个网格重复的次数；N=10 时共有 5120 次独立请求。
+N = 3 # 每个网格重复的次数；N=10 时共有 5120 次独立请求。
 OBSERVATION_FORMAT = "grid_3x3"  # 新批次使用完整 512 种网格；neighbor_counts 保留用于旧格式兼容。
-PROVIDER = "qwen"  # "gpt" 使用 API/gpt.env；"qwen" 使用 API/Qwen.env。
+PROVIDER = "gpt"  # "gpt": gpt.env；"qwen": Qwen.env；"deepseek": Deepseek4.1flash（均在 API/）。
 QWEN_REASONING_EFFORT = "medium"  # 仅 Qwen："low"、"medium"、"xhigh"；新批次生效。
-MODEL = "gpt-5.5"
-MAX_OUTPUT_TOKENS = 10240  # 内部推理和最终回答共用此上限。
+MODEL = "gpt-5.5"  # 仅 GPT；Qwen/DeepSeek 的模型 ID 在 llm_provider.py 中设置。
+MAX_OUTPUT_TOKENS = 51200  # 内部推理和最终回答共用此上限。
 TIMEOUT_SECONDS = 1800
 TLS_RETRIES = 5  # 每条请求连接异常关闭后的额外重试次数；0 表示关闭。
 RETRY_DELAY_SECONDS = 5  # 重试前等待秒数，可按 Ctrl+C 中断。
@@ -181,10 +186,15 @@ Return only one action: C or D."""
 def make_request(case, max_tokens, provider=None, *, qwen_reasoning_effort=None):
     # 每次只发送当前状态，没有 previous_response_id、conversation 或以前的输入/输出。
     provider = normalize_provider(PROVIDER if provider is None else provider)
+    if provider != "qwen" and qwen_reasoning_effort is not None:
+        raise ValueError("Qwen 思考强度只适用于 provider=qwen。")
     if provider == "qwen":
         effort = QWEN_REASONING_EFFORT if qwen_reasoning_effort is None else qwen_reasoning_effort
         return build_qwen_request(SYSTEM_PROMPT, build_user_prompt(case),
                                   model=QWEN_MODEL, max_tokens=max_tokens, reasoning_effort=effort)
+    if provider == "deepseek":
+        return build_deepseek_request(SYSTEM_PROMPT, build_user_prompt(case),
+                                     model=DEEPSEEK_MODEL, max_tokens=max_tokens)
     if "grid_rows" in case:
         return {"model": MODEL,
                 "input": [{"role": "system", "content": SYSTEM_PROMPT},
@@ -195,14 +205,20 @@ def make_request(case, max_tokens, provider=None, *, qwen_reasoning_effort=None)
 
 
 def provider_metadata(provider):
+    provider = normalize_provider(provider)
     return {"provider": provider,
-            "api_interface": "chat.completions" if provider == "qwen" else "responses",
+            "api_interface": "chat.completions" if provider in {"qwen", "deepseek"} else "responses",
             "env_file": "API/" + provider_env_file(provider).name}
 
 
 def load_provider_config(provider):
-    # 旧 GPT 配置与测试入口保持不变；Qwen 不回退到 GPT 密钥或地址。
-    return load_qwen_config() if provider == "qwen" else load_config(DEFAULT_ENV_FILE)
+    # 各服务只读取自己的配置文件，不回退到另一把密钥。
+    provider = normalize_provider(provider)
+    if provider == "qwen":
+        return load_qwen_config()
+    if provider == "deepseek":
+        return load_deepseek_config()
+    return load_config(DEFAULT_ENV_FILE)
 
 
 def describe_case(case):
@@ -269,7 +285,7 @@ def call_once(openai, api_key, base_url, record, timeout):
         with openai.OpenAI(api_key=api_key, base_url=base_url,
                            timeout=timeout, max_retries=0, http_client=http_client) as client:
             record["api_call_started"] = True
-            if record.get("provider", "gpt") == "qwen":
+            if record.get("provider", "gpt") in {"qwen", "deepseek"}:
                 response = client.chat.completions.create(**record["request"])
                 record["output_text"], record["response"] = chat_response_record(response)
                 try:
@@ -527,29 +543,32 @@ def read_batch(directory):
         raise ResumeError("缺少 records 目录，不能确定哪些请求已经成功。")
 
     # 网格批次必须有完整的原始请求，不使用今天的提示词重建历史实验。
-    if (observation_format == "grid_3x3" or provider == "qwen") and "requests" not in config:
+    if (observation_format == "grid_3x3" or provider in {"qwen", "deepseek"}) and "requests" not in config:
         raise ResumeError("网格批次缺少保存的 requests 模板，已停止续跑。")
     templates = config.get("requests", [None] * case_count)
     if not isinstance(templates, list) or len(templates) != case_count:
         raise ResumeError("config.json 中的请求模板不合法。")
     templates = list(templates)
-    if (observation_format == "grid_3x3" or provider == "qwen") and any(template is None for template in templates):
+    if (observation_format == "grid_3x3" or provider in {"qwen", "deepseek"}) and any(template is None for template in templates):
         raise ResumeError("网格批次的请求模板不完整，已停止续跑。")
 
     def check_request(request):
-        if provider == "qwen":
+        if provider in {"qwen", "deepseek"}:
             messages = request.get("messages") if isinstance(request, dict) else None
             if (not isinstance(messages, list) or len(messages) != 2
                     or not isinstance(messages[1], dict)
                     or not isinstance(messages[1].get("content"), str)
                     or not messages[1]["content"]):
-                raise ResumeError("Qwen 记录缺少独立的 system/user 请求，已停止续跑。")
-            expected = build_qwen_request(config["system_prompt"], messages[1]["content"],
-                                          model=config["model"], max_tokens=config["max_output_tokens"],
-                                          reasoning_effort=effort)
-            if (request != expected or request.get("stream") is not False
-                    or request.get("extra_body", {}).get("cache_prompt") is not False):
-                raise ResumeError("Qwen 请求与批次配置不一致，或包含历史/缓存/未知参数，已停止续跑。")
+                raise ResumeError(f"{provider} 记录缺少独立的 system/user 请求，已停止续跑。")
+            if provider == "qwen":
+                expected = build_qwen_request(config["system_prompt"], messages[1]["content"],
+                                              model=config["model"], max_tokens=config["max_output_tokens"],
+                                              reasoning_effort=effort)
+            else:
+                expected = build_deepseek_request(config["system_prompt"], messages[1]["content"],
+                                                  model=config["model"], max_tokens=config["max_output_tokens"])
+            if request != expected or request.get("stream") is not False:
+                raise ResumeError(f"{provider} 请求与批次配置不一致，或包含历史/缓存/未知参数，已停止续跑。")
             return
         keys = {"model", "input", "max_output_tokens", "store"}
         if observation_format == "neighbor_counts":
@@ -598,13 +617,13 @@ def read_batch(directory):
                 or not isinstance(record["response"], dict)
                 or (provider == "gpt" and record["response"].get("status") != "completed")):
             raise ResumeError(f"{path.name} 的成功标记与输出不一致。")
-        if record["status"] == "success" and provider == "qwen":
+        if record["status"] == "success" and provider in {"qwen", "deepseek"}:
             try:
                 action = validate_chat_response(record["response"])
                 if action != record["action"]:
                     raise ValueError
             except ValueError:
-                raise ResumeError(f"{path.name} 的成功标记与原始 Qwen 回复不一致。") from None
+                raise ResumeError(f"{path.name} 的成功标记与原始 {provider} 回复不一致。") from None
         request = record.get("request")
         check_request(request)
         if templates[case_index] is not None and templates[case_index] != request:
@@ -745,7 +764,7 @@ def resume_batch(args):
         if configured_url.rstrip("/") != config["base_url"].rstrip("/"):
             raise ResumeError("当前 API 地址与原批次不同。请先恢复原地址，避免使用错误平台的密钥续跑。")
         timeout = args.timeout if args.timeout is not None else config["timeout_seconds"]
-        trust_env = config.get("trust_env", provider == "gpt") if args.trust_env is None else args.trust_env
+        trust_env = config.get("trust_env", provider != "qwen") if args.trust_env is None else args.trust_env
         case_count = len(config["cases"])
         started_at = min((r["started_at"] for r in records.values()), default=now())
         summary = resumed_summary(config, records, archived, started_at, "running")
@@ -873,7 +892,7 @@ def resume_batch(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--provider", type=normalize_provider, choices=PROVIDERS,
-                        help="gpt 读取 gpt.env；qwen 读取 Qwen.env。新批次默认 PROVIDER，续跑沿用原批次")
+                        help="gpt 读取 gpt.env；qwen 读取 Qwen.env；deepseek 读取 Deepseek4.1flash。新批次默认 PROVIDER，续跑沿用原批次")
     parser.add_argument("--qwen-reasoning-effort", type=normalize_qwen_reasoning_effort,
                         choices=QWEN_REASONING_EFFORTS,
                         help="仅 Qwen 新批次：思考强度，默认读取 QWEN_REASONING_EFFORT")
@@ -912,7 +931,7 @@ def main(argv=None):
             parser.error("--qwen-reasoning-effort 仅用于 --provider qwen")
     except ValueError as exc:
         parser.error(str(exc))
-    model = QWEN_MODEL if args.provider == "qwen" else MODEL
+    model = {"gpt": MODEL, "qwen": QWEN_MODEL, "deepseek": DEEPSEEK_MODEL}[args.provider]
     args.b = B if args.b is None else args.b
     args.observation_format = OBSERVATION_FORMAT
     if args.trust_env is None:
@@ -993,7 +1012,8 @@ def main(argv=None):
                                       qwen_reasoning_effort=args.qwen_reasoning_effort) for case in cases],
             "max_output_tokens": args.max_tokens, "timeout_seconds": args.timeout,
             "max_retries": 0, "continue_on_error": args.continue_on_error,
-            **({"cache_prompt": False} if args.provider == "qwen" else {"store": False}),
+            **({"cache_prompt": False} if args.provider == "qwen" else
+               {"store": False} if args.provider == "gpt" else {}),
             "tls_retries": args.tls_retries, "retry_delay_seconds": args.retry_delay,
             "order": ("每轮按行优先九格键枚举 C/D，保留全部旋转和镜像；共 n 轮；每次独立无历史。"
                       if args.observation_format == "grid_3x3" else

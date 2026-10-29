@@ -100,7 +100,7 @@ class ParallelRunTests(unittest.TestCase):
 
     def invoke(self, arguments):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            return runner.main(arguments)
+            return runner.main(["--advice-mode", "fixed"] + arguments)
 
     def scan_arguments(self, output, workers, details):
         return [
@@ -170,7 +170,7 @@ class ParallelRunTests(unittest.TestCase):
 
     def test_script_entry_from_spd_directory_spawns_repeats_and_matches_serial(self):
         common = [
-            "--single", "--repeats", "2", "--seed", "42", "--size", "3", "--steps", "3",
+            "--advice-mode", "fixed", "--single", "--repeats", "2", "--seed", "42", "--size", "3", "--steps", "3",
             "--lambda", "1", "--p", "0.5", "--b", "1.5", "--k", "0.1",
             "--initial-cooperation", "0.5", "--boundary", "periodic", "--update-mode", "synchronous",
             "--paired-fermi-control", "--early-average-steps", "2", "--tail-average-steps", "2",
@@ -336,7 +336,7 @@ class ParallelRunTests(unittest.TestCase):
         arguments = self.scan_arguments(output, workers=2, details=False)
         with patch.object(Path, "replace", deny_primary_updates), \
                 redirect_stdout(terminal), redirect_stderr(terminal):
-            self.assertEqual(runner.main(arguments), 0)
+            self.assertEqual(runner.main(["--advice-mode", "fixed"] + arguments), 0)
 
         batch = next(output.glob("scan_*"))
         metadata = read_json(batch / "scan_config.json")

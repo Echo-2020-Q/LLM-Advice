@@ -144,6 +144,10 @@ class GridBatchTests(unittest.TestCase):
         spec.loader.exec_module(cls.module)
 
     def setUp(self):
+        # 此组测试针对 GPT，不能依赖用户在脚本中选择的默认服务。
+        provider = patch.object(self.module, "PROVIDER", "gpt")
+        provider.start()
+        self.addCleanup(provider.stop)
         temporary = tempfile.TemporaryDirectory(prefix="offline_grid_batch_")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
