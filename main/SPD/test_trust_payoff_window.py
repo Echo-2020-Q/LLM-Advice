@@ -1,8 +1,7 @@
-"""信任学习使用近期已完成回合的均值，博弈与 Fermi 仍用瞬时收益。"""
+"""信任比较本轮收益与此前窗口均值，包含初始收益且排除本轮。"""
 
 from contextlib import redirect_stderr, redirect_stdout
 import csv
-from dataclasses import replace
 import io
 import json
 import math
@@ -24,7 +23,7 @@ class TrustPayoffWindowTests(unittest.TestCase):
     def model(self, advisor=None, **changes):
         values = dict(size=3, seed=29, update_mode="synchronous", advice_mode="adaptive",
                       initial_trust=0.5, trust_learning_rate=0.2,
-                      aspiration_learning_rate=0.2, trust_payoff_window=3)
+                      trust_payoff_window=3)
         values.update(changes)
         advisor = advisor or (lambda context: "D" if context.round % 2 else "C")
         model = SpatialPrisonersDilemma(SimulationConfig(**values), advisor=advisor,
@@ -38,42 +37,57 @@ class TrustPayoffWindowTests(unittest.TestCase):
             for value in row:
                 self.assertAlmostEqual(value, expected)
 
-    def test_window_warmup_excludes_initial_payoff_and_discards_oldest_round(self):
+    def test_window_warmup_includes_initial_payoff_and_excludes_current_round(self):
         model = self.model()
         self.assert_uniform(model.aspiration_grid, 4.0)
         self.assertIsNone(model.trust_payoff_grid)
+        self.assertIsNone(model.feedback_reference_grid)
         self.assertIsNone(model.trust_statistics()["eligible_feedback_payoff_mean"])
-        # 初态收益为 4；完成回合收益依次 0,4,0,4。第 0 轮不加入窗口。
-        for expected in (0, 2, 4 / 3, 8 / 3):
+        self.assertIsNone(model.trust_statistics()["eligible_feedback_reference_mean"])
+        # π0=4；新收益为0,4,0,4。第4轮严格与π1、π2、π3平均比较。
+        for current, reference, next_reference in (
+                (0, 4, 2), (4, 2, 8 / 3), (0, 8 / 3, 4 / 3), (4, 4 / 3, 8 / 3)):
             model.step()
-            self.assert_uniform(model.trust_payoff_grid, expected)
-            self.assertAlmostEqual(model.trust_statistics()["eligible_feedback_payoff_mean"],
-                                   expected)
-        snapshot = model.trust_payoff_grid
-        with self.assertRaises(TypeError):
-            snapshot[0][0] = 999
+            self.assert_uniform(model.trust_payoff_grid, current)
+            self.assert_uniform(model.feedback_reference_grid, reference)
+            self.assert_uniform(model.aspiration_grid, next_reference)
+            statistics = model.trust_statistics()
+            self.assertAlmostEqual(statistics["eligible_feedback_payoff_mean"], current)
+            self.assertAlmostEqual(statistics["eligible_feedback_reference_mean"], reference)
+            self.assertAlmostEqual(statistics["eligible_aspiration_mean"], next_reference)
+        snapshots = (model.trust_payoff_grid, model.feedback_reference_grid,
+                     model.aspiration_grid)
+        for snapshot in snapshots:
+            with self.assertRaises(TypeError):
+                snapshot[0][0] = 999
         model.step()
-        self.assert_uniform(snapshot, 8 / 3)
-        self.assert_uniform(model.trust_payoff_grid, 4 / 3)
+        for snapshot, expected in zip(snapshots, (4, 4 / 3, 8 / 3)):
+            self.assert_uniform(snapshot, expected)
+        self.assert_uniform(model.trust_payoff_grid, 0)
+        self.assert_uniform(model.feedback_reference_grid, 8 / 3)
 
-    def test_mean_can_reverse_feedback_direction_from_instantaneous_payoff(self):
+    def test_current_raw_payoff_not_current_inclusive_average_drives_feedback(self):
         model = self.model()
-        model.step()  # 收益 0，旧参考 4，信任 0.4，新参考 3.2。
-        model.step()  # 当前收益 4，但窗口均值 2 < 旧参考 3.2，仍应负反馈。
-        self.assert_uniform(model.trust_grid, 0.32)
-        self.assert_uniform(model.aspiration_grid, 2.96)
+        model.step()  # 收益0，参考π0=4，信任0.4；新历史均值2。
+        model.step()  # 当前收益4 > 历史均值2，必须正反馈，不比较含本轮均值。
+        self.assert_uniform(model.trust_grid, 0.52)
+        self.assert_uniform(model.feedback_reference_grid, 2)
+        self.assert_uniform(model.trust_payoff_grid, 4)
+        self.assert_uniform(model.aspiration_grid, 8 / 3)
         self.assertEqual(model.measure().average_payoff, 4.0)
         self.assertEqual(model.payoff(1, 1), 4.0)
-        self.assertEqual(model.trust_statistics()["trust_negative_feedback"], 9)
-        self.assertEqual(model.trust_statistics()["trust_positive_feedback"], 0)
+        self.assertEqual(model.trust_statistics()["trust_negative_feedback"], 0)
+        self.assertEqual(model.trust_statistics()["trust_positive_feedback"], 9)
 
-    def test_beta_one_feedback_compares_with_old_reference_before_replacement(self):
-        model = self.model(aspiration_learning_rate=1)
-        expected = ((0, 0.4, "negative"), (2, 0.52, "positive"),
-                    (4 / 3, 0.416, "negative"), (8 / 3, 0.5328, "positive"))
-        for reference, trust, direction in expected:
+    def test_feedback_uses_old_window_before_appending_current_reward(self):
+        model = self.model()
+        expected = ((4, 2, 0.4, "negative"), (2, 8 / 3, 0.52, "positive"),
+                    (8 / 3, 4 / 3, 0.416, "negative"),
+                    (4 / 3, 8 / 3, 0.5328, "positive"))
+        for feedback_reference, next_reference, trust, direction in expected:
             model.step()
-            self.assert_uniform(model.aspiration_grid, reference)
+            self.assert_uniform(model.feedback_reference_grid, feedback_reference)
+            self.assert_uniform(model.aspiration_grid, next_reference)
             self.assert_uniform(model.trust_grid, trust)
             self.assertEqual(model.trust_statistics()[f"trust_{direction}_feedback"], 9)
 
@@ -83,12 +97,12 @@ class TrustPayoffWindowTests(unittest.TestCase):
                 return "D" if context.position == (1, 1) else "C"
             return None
 
-        model = self.model(advisor=advisor, aspiration_learning_rate=0.25)
-        past = []
-        expected_reference = [[4.0] * 3 for _ in range(3)]
+        model = self.model(advisor=advisor)
+        past = [((4.0,) * 3,) * 3]
         after_adoption = None
         found_mean_different_from_current = False
         for round_number in range(1, 5):
+            prior_window = past[-3:]
             stats = model.step()
             past.append([[model.payoff(r, c) for c in range(3)] for r in range(3)])
             window = past[-3:]
@@ -98,12 +112,11 @@ class TrustPayoffWindowTests(unittest.TestCase):
                     found_mean_different_from_current |= (
                         abs(average - past[-1][row][col]) > 1e-10
                     )
-                    expected_reference[row][col] = (
-                        0.75 * expected_reference[row][col] + 0.25 * average
-                    )
-                    self.assertAlmostEqual(model.trust_payoff_grid[row][col], average)
-                    self.assertAlmostEqual(model.aspiration_grid[row][col],
-                                           expected_reference[row][col])
+                    self.assertEqual(model.trust_payoff_grid[row][col], past[-1][row][col])
+                    self.assertAlmostEqual(model.feedback_reference_grid[row][col],
+                                           math.fsum(p[row][col] for p in prior_window)
+                                           / len(prior_window))
+                    self.assertAlmostEqual(model.aspiration_grid[row][col], average)
             if round_number == 1:
                 after_adoption = model.trust_grid
             self.assertEqual(model.trust_grid, after_adoption)
@@ -114,14 +127,15 @@ class TrustPayoffWindowTests(unittest.TestCase):
                     self.assertEqual(model.trust_statistics()[f"trust_{direction}_feedback"], 0)
         self.assertTrue(found_mean_different_from_current)
 
-    def test_fermi_reads_current_payoffs_even_when_last_feedback_mean_differs(self):
+    def test_fermi_reads_current_payoffs_even_when_historical_reference_differs(self):
         def advisor(context):
             return {1: "D", 2: "C"}.get(context.round)
 
         model = self.model(advisor=advisor)
         model.step()
         model.step()
-        self.assert_uniform(model.trust_payoff_grid, 2)
+        self.assert_uniform(model.trust_payoff_grid, 4)
+        self.assert_uniform(model.aspiration_grid, 8 / 3)
         with patch.object(simulation, "fermi_probability", wraps=simulation.fermi_probability) as fermi:
             stats = model.step()
         self.assertEqual(stats.fermi_updates, 9)
@@ -129,38 +143,34 @@ class TrustPayoffWindowTests(unittest.TestCase):
         for call in fermi.call_args_list:
             self.assertEqual(call.args, (4.0, 4.0, model.config.k))
 
-    def test_window_one_preserves_original_instantaneous_learning_trajectory(self):
+    def test_window_one_is_exact_comparison_to_previous_round_raw_payoff(self):
         grid = ("CDC", "CCD", "DDC")
         config = SimulationConfig(size=3, seed=42, update_mode="synchronous",
                                   advice_mode="adaptive", initial_trust=0.7,
-                                  trust_learning_rate=0.2, aspiration_learning_rate=0.3)
-        self.assertEqual(config.trust_payoff_window, 1)
+                                  trust_learning_rate=0.2, trust_payoff_window=1)
+        self.assertEqual(SimulationConfig().trust_payoff_window, 3)
 
         def advisor(context):
             return "C" if context.cooperating_neighbors < 2 else "D"
 
-        default = SpatialPrisonersDilemma(config, advisor=advisor, initial_grid=grid)
-        explicit = SpatialPrisonersDilemma(replace(config, trust_payoff_window=1),
-                                           advisor=advisor, initial_grid=grid)
-        reference = [list(row) for row in default.aspiration_grid]
-        trust = [list(row) for row in default.trust_grid]
+        model = SpatialPrisonersDilemma(config, advisor=advisor, initial_grid=grid)
+        reference = [list(row) for row in model.aspiration_grid]
+        trust = [list(row) for row in model.trust_grid]
         for _ in range(8):
-            self.assertEqual(default.step(), explicit.step())
-            self.assertEqual(default.grid, explicit.grid)
-            self.assertEqual(default.trust_grid, explicit.trust_grid)
-            self.assertEqual(default.aspiration_grid, explicit.aspiration_grid)
+            model.step()
             for row in range(3):
                 for col in range(3):
-                    payoff = default.payoff(row, col)
-                    if default.last_advice_grid[row][col]:
-                        if payoff > reference[row][col]:
+                    payoff = model.payoff(row, col)
+                    self.assertEqual(model.feedback_reference_grid[row][col], reference[row][col])
+                    if model.last_advice_grid[row][col]:
+                        if payoff > reference[row][col] + config.trust_feedback_threshold:
                             trust[row][col] += 0.2 * (1 - trust[row][col])
-                        elif payoff < reference[row][col]:
+                        elif payoff < reference[row][col] - config.trust_feedback_threshold:
                             trust[row][col] *= 0.8
-                    reference[row][col] = 0.7 * reference[row][col] + 0.3 * payoff
-                    self.assertEqual(default.trust_payoff_grid[row][col], payoff)
-                    self.assertEqual(default.trust_grid[row][col], trust[row][col])
-                    self.assertEqual(default.aspiration_grid[row][col], reference[row][col])
+                    reference[row][col] = payoff
+                    self.assertEqual(model.trust_payoff_grid[row][col], payoff)
+                    self.assertEqual(model.trust_grid[row][col], trust[row][col])
+                    self.assertEqual(model.aspiration_grid[row][col], payoff)
 
     def test_invalid_windows_and_undefined_learning_statistics(self):
         for value in (0, -1, 1.5, "3", True, math.nan, math.inf):
@@ -171,10 +181,13 @@ class TrustPayoffWindowTests(unittest.TestCase):
                                         update_mode="synchronous", llm_access_fraction=0)):
             model = SpatialPrisonersDilemma(config)
             self.assertIsNone(model.trust_payoff_grid)
+            self.assertIsNone(model.feedback_reference_grid)
             model.step()
             self.assertIsNone(model.trust_statistics()["eligible_feedback_payoff_mean"])
+            self.assertIsNone(model.trust_statistics()["eligible_feedback_reference_mean"])
             if config.advice_mode == "fixed":
                 self.assertIsNone(model.trust_payoff_grid)
+                self.assertIsNone(model.feedback_reference_grid)
 
 
 def read_csv(path):
@@ -189,7 +202,7 @@ class TrustPayoffWindowIntegrationTests(BatchFixtureTests):
             "--size", "3", "--steps", "5", "--b", "1.5", "--k", "0.1", "--seed", "13",
             "--p", "0.5", "--initial-cooperation", "0.5", "--boundary", "periodic",
             "--update-mode", "synchronous", "--initial-trust", "0.6",
-            "--trust-learning-rate", "0.2", "--aspiration-learning-rate", "0.3",
+            "--trust-learning-rate", "0.2",
             "--trust-payoff-window", "3", "--paired-fermi-control", "--early-average-steps", "2",
             "--tail-average-steps", "2", "--report-every", "0", "--advisor-batch", str(self.batch),
             "--output-dir", str(output),
@@ -197,7 +210,7 @@ class TrustPayoffWindowIntegrationTests(BatchFixtureTests):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             return runner.main(arguments + list(extra))
 
-    def test_cli_window_and_history_match_actual_included_post_step_rewards(self):
+    def test_cli_window_and_history_compare_current_to_prior_raw_rewards(self):
         output = self.root / "single"
         self.assertEqual(self.invoke(output), 0)
         run = next(output.iterdir())
@@ -205,13 +218,21 @@ class TrustPayoffWindowIntegrationTests(BatchFixtureTests):
         self.assertEqual(metadata["config"]["trust_payoff_window"], 3)
         history = read_csv(run / "history.csv")
         self.assertEqual(history[0]["eligible_feedback_payoff_mean"], "")
-        recent = []
+        self.assertEqual(history[0]["eligible_feedback_reference_mean"], "")
+        recent = [float(history[0]["eligible_mean_payoff"])]
         for row in history[1:]:
-            recent.append(float(row["eligible_mean_payoff"]))
+            reference = math.fsum(recent[-3:]) / len(recent[-3:])
+            current = float(row["eligible_mean_payoff"])
             self.assertAlmostEqual(float(row["eligible_feedback_payoff_mean"]),
+                                   current)
+            self.assertAlmostEqual(float(row["eligible_feedback_reference_mean"]), reference)
+            recent.append(current)
+            self.assertAlmostEqual(float(row["eligible_aspiration_mean"]),
                                    math.fsum(recent[-3:]) / len(recent[-3:]))
         self.assertAlmostEqual(metadata["summary"]["final_eligible_feedback_payoff_mean"],
                                float(history[-1]["eligible_feedback_payoff_mean"]))
+        self.assertAlmostEqual(metadata["summary"]["final_eligible_feedback_reference_mean"],
+                               float(history[-1]["eligible_feedback_reference_mean"]))
 
     def test_cli_invalid_window_fails_before_output_creation(self):
         for value in ("0", "-2", "1.5", "nan"):
@@ -234,6 +255,7 @@ class TrustPayoffWindowIntegrationTests(BatchFixtureTests):
             for row in read_csv(batch / "summary.csv"):
                 self.assertEqual(row["trust_payoff_window"], "3")
                 self.assertNotEqual(row["final_eligible_feedback_payoff_mean"], "")
+                self.assertNotEqual(row["final_eligible_feedback_reference_mean"], "")
         self.assertEqual((batches[0] / "summary.csv").read_bytes(),
                          (batches[1] / "summary.csv").read_bytes())
         for row in read_csv(batches[0] / "summary.csv"):

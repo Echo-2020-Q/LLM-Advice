@@ -35,7 +35,7 @@ class ParameterScanTests(unittest.TestCase):
         # 可编辑实验默认值属于用户配置；测试固定默认模式，再由各用例显式覆盖。
         defaults = patch.multiple(runner, REPEATS=1, SCAN_ENABLED=False, SCAN_SEEDS=None,
                                   SCAN_SAVE_DETAILS=True, PAIRED_FERMI_CONTROL=False, NUM_WORKERS=1,
-                                  ADVICE_MODE="fixed")
+                                  ADVICE_MODE="fixed", SCAN_HISTORY_MODE="full", SCAN_HISTORY_EVERY=1)
         defaults.start()
         self.addCleanup(defaults.stop)
         # 此组测试隔离扫描与汇总逻辑，显式保留空建议；真实本地抽样由 test_llm_advisor 覆盖。

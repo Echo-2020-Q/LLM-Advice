@@ -5,7 +5,8 @@
 初始化时随机选定 floor(llm_access_fraction * L²) 人拥有建议资格，之后不再重选。
 固定模式有资格者以概率 lambda_prob 请求并直接采用建议，否则执行 Fermi 模仿。
 自适应模式仅支持同步更新，以个人信任作为采纳概率，按相对历史参考收益的反馈学习。
-反馈收益取最近 trust_payoff_window 个完整轮的个人平均收益，初态仅初始化参考、不入窗口。
+反馈为当前轮个人收益减去此前 trust_payoff_window 条历史收益均值，当前轮不进入比较基准。
+初始收益作为第一条历史；信任反馈结束后才将当前轮收益加入历史，并更新下一轮基准。
 无资格者始终执行 Fermi，仍可模仿有资格邻居；建议为 None 时也回退 Fermi。
 资格比例和每次咨询概率是两个独立参数，不能用两者的乘积代替固定资格人群。
 建议上下文另提供以个体为中心的 3×3 策略窗口，收益和 Fermi 模仿仍仅使用四邻居。
@@ -40,8 +41,8 @@ class SimulationConfig:
     advice_mode: str = "fixed"
     initial_trust: float = 0.5
     trust_learning_rate: float = 0.1
-    aspiration_learning_rate: float = 0.1
-    trust_payoff_window: int = 1
+    trust_payoff_window: int = 3
+    trust_feedback_threshold: float = 0.01
 
     def __post_init__(self):
         if type(self.size) is not int or self.size < 3:
@@ -52,7 +53,7 @@ class SimulationConfig:
             raise ValueError("k 必须是有限正数。")
         for name in (
             "lambda_prob", "initial_cooperation", "llm_access_fraction",
-            "initial_trust", "trust_learning_rate", "aspiration_learning_rate",
+            "initial_trust", "trust_learning_rate",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or not 0 <= value <= 1:
@@ -61,6 +62,10 @@ class SimulationConfig:
             raise ValueError("seed 必须是整数。")
         if type(self.trust_payoff_window) is not int or self.trust_payoff_window < 1:
             raise ValueError("trust_payoff_window 必须为正整数。")
+        if (isinstance(self.trust_feedback_threshold, bool)
+                or not math.isfinite(self.trust_feedback_threshold)
+                or self.trust_feedback_threshold < 0):
+            raise ValueError("trust_feedback_threshold 必须为有限非负数。")
         if self.boundary not in {"periodic", "open"}:
             raise ValueError("boundary 必须为 periodic 或 open。")
         if self.update_mode not in {"asynchronous", "synchronous"}:
@@ -74,6 +79,11 @@ class SimulationConfig:
     def llm_access_count(self) -> int:
         """固定资格人数向下取整；按十进制计算，避免 0.29 × 100 被误取为 28。"""
         return int(Decimal(str(float(self.llm_access_fraction))) * self.size ** 2)
+
+    @property
+    def trust_feedback_rule(self) -> Optional[str]:
+        """记录收益反馈的具体规则，便于区分旧的平滑收益实验。"""
+        return "current_payoff_vs_prior_mean" if self.advice_mode == "adaptive" else None
 
 
 @dataclass(frozen=True)
@@ -144,14 +154,14 @@ class SpatialPrisonersDilemma:
         self._aspiration = None
         self._payoff_history = None
         self._trust_payoffs = None
+        self._feedback_reference = None
         if config.advice_mode == "adaptive":
             self._trust = [config.initial_trust if eligible else 0.0
                            for eligible in self._llm_access]
-            # 所有位置参考收益从自己的初始收益开始；不占用任一随机流。
+            # 初始收益是第一条历史；第1轮实际收益将与它比较，不占用随机流。
             self._aspiration = [self._payoff(i, self._strategies)
                                 for i in range(self._population)]
-            # round0仅用于A0，不算已完成回合；之后每轮原始收益均入窗口。
-            self._payoff_history = deque(maxlen=config.trust_payoff_window)
+            self._payoff_history = deque([tuple(self._aspiration)], maxlen=config.trust_payoff_window)
 
     def _build_neighbors(self, index: int) -> tuple[int, ...]:
         size = self.config.size
@@ -189,7 +199,7 @@ class SpatialPrisonersDilemma:
 
     @property
     def aspiration_grid(self) -> Optional[tuple[tuple[float, ...], ...]]:
-        """动态模式所有个体的历史参考收益快照；固定模式为 None。"""
+        """供下一轮使用的历史窗口均值；初态为π0，固定模式为None。"""
         if self._aspiration is None:
             return None
         size = self.config.size
@@ -198,11 +208,20 @@ class SpatialPrisonersDilemma:
 
     @property
     def trust_payoff_grid(self) -> Optional[tuple[tuple[float, ...], ...]]:
-        """本轮信任学习实际使用的最近W轮平均收益；初态/固定模式为None。"""
+        """本轮信任学习使用的当前轮原始收益；初态/固定模式为None。"""
         if self._trust_payoffs is None:
             return None
         size = self.config.size
         return tuple(tuple(self._trust_payoffs[i:i + size])
+                     for i in range(0, self._population, size))
+
+    @property
+    def feedback_reference_grid(self) -> Optional[tuple[tuple[float, ...], ...]]:
+        """本轮比较时使用的历史均值，排除当前轮；初态/固定模式为None。"""
+        if self._feedback_reference is None:
+            return None
+        size = self.config.size
+        return tuple(tuple(self._feedback_reference[i:i + size])
                      for i in range(0, self._population, size))
 
     @property
@@ -224,6 +243,7 @@ class SpatialPrisonersDilemma:
             "eligible_trust_max", "eligible_low_trust_fraction",
             "eligible_high_trust_fraction", "eligible_aspiration_mean",
             "eligible_feedback_payoff_mean",
+            "eligible_feedback_reference_mean",
         ))
         result.update(dict.fromkeys(f"eligible_trust_bin_{i}" for i in range(10)))
         result["eligible_advice_rate"] = (
@@ -253,6 +273,10 @@ class SpatialPrisonersDilemma:
                 self._trust_payoffs[i] / eligible_count
                 for i, eligible in enumerate(self._llm_access) if eligible
             ) if self._trust_payoffs is not None else None),
+            eligible_feedback_reference_mean=(math.fsum(
+                self._feedback_reference[i] / eligible_count
+                for i, eligible in enumerate(self._llm_access) if eligible
+            ) if self._feedback_reference is not None else None),
         )
         bins = [0] * 10
         for value in trust:
@@ -377,34 +401,36 @@ class SpatialPrisonersDilemma:
         )
 
     def _update_trust_and_aspiration(self, state: Sequence[Strategy]) -> None:
-        """结算新网格收益，最近W轮均值对旧参考反馈，最后更新参考。"""
+        """当前轮收益与此前历史均值比较，反馈后才将当前轮收益加入历史。"""
         alpha = self.config.trust_learning_rate
-        beta = self.config.aspiration_learning_rate
+        threshold = self.config.trust_feedback_threshold
         payoffs = tuple(self._payoff(index, state) for index in range(self._population))
-        self._payoff_history.append(payoffs)
-        count = len(self._payoff_history)
-        # 用当前收益为原点，既避免相同收益的均值舍入偏差，也避免大收益求和溢出。
-        self._trust_payoffs = tuple(
-            current + math.fsum((previous[index] - current) / count
-                                for previous in self._payoff_history)
-            for index, current in enumerate(payoffs)
-        ) if count > 1 else payoffs
+        self._trust_payoffs = payoffs
+        self._feedback_reference = tuple(self._aspiration)
         positive = negative = zero = 0
         for index in range(self._population):
             payoff = self._trust_payoffs[index]
             aspiration = self._aspiration[index]
             if self._last_advice[index]:
-                if payoff > aspiration:
+                # 等于阈值也归为无变化；比较收益边界，避免1.01-1的舍入误触发。
+                if payoff > aspiration + threshold:
                     positive += 1
                     self._trust[index] += alpha * (1 - self._trust[index])
-                elif payoff < aspiration:
+                elif payoff < aspiration - threshold:
                     negative += 1
                     self._trust[index] *= 1 - alpha
                 else:
                     zero += 1
-            # 包括未采纳、无资格个体；反馈始终使用上面的旧 aspiration。
-            self._aspiration[index] = (1 - beta) * aspiration + beta * payoff
         self._trust_feedback = (positive, negative, zero)
+        # 所有位置、所有轮次都进入历史，不因是否实际采纳而筛掉收益。
+        self._payoff_history.append(payoffs)
+        count = len(self._payoff_history)
+        # 用当前收益为原点，恒定收益不产生均值舍入偏差，且避免大收益直接求和溢出。
+        self._aspiration = [
+            current + math.fsum((previous[index] - current) / count
+                                for previous in self._payoff_history)
+            for index, current in enumerate(payoffs)
+        ] if count > 1 else list(payoffs)
 
     def run(self, steps: int) -> list[RoundStats]:
         """返回当前状态及之后 steps 轮的统计；初次运行包含第 0 轮。"""

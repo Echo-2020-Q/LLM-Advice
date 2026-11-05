@@ -6,6 +6,7 @@ from dataclasses import replace
 import io
 from itertools import product
 import json
+import math
 from unittest.mock import patch
 
 from main.SPD import run_experiment as runner
@@ -29,7 +30,7 @@ class TrustIntegrationTests(BatchFixtureTests):
             "--size", "3", "--steps", "4", "--b", "1.5", "--k", "0.1", "--seed", "13",
             "--p", "0.5", "--initial-cooperation", "0.5", "--boundary", "periodic",
             "--update-mode", "synchronous", "--initial-trust", "0.6",
-            "--trust-learning-rate", "0.2", "--aspiration-learning-rate", "0.3",
+            "--trust-learning-rate", "0.2", "--trust-payoff-window", "3",
             "--paired-fermi-control", "--early-average-steps", "2", "--tail-average-steps", "2",
             "--report-every", "0", "--advisor-batch", str(self.batch), "--output-dir", str(output),
         ]
@@ -56,7 +57,9 @@ class TrustIntegrationTests(BatchFixtureTests):
         self.assertEqual(config.advice_mode, "adaptive")
         self.assertEqual(config.initial_trust, 0.6)
         self.assertEqual(config.trust_learning_rate, 0.2)
-        self.assertEqual(config.aspiration_learning_rate, 0.3)
+        self.assertEqual(config.trust_payoff_window, 3)
+        self.assertNotIn("aspiration_learning_rate", metadata["config"])
+        self.assertEqual(metadata["trust_feedback_rule"], "current_payoff_vs_prior_mean")
         self.assertEqual(config.lambda_prob, 0)
         self.assertEqual(metadata["status"], "completed")
         control = SpatialPrisonersDilemma(replace(config, advice_mode="fixed", lambda_prob=0))
@@ -80,6 +83,7 @@ class TrustIntegrationTests(BatchFixtureTests):
             else:
                 self.assert_number(row["eligible_advice_rate"], int(row["advice_used"]) / 4)
         summary = metadata["summary"]
+        self.assertEqual(summary["trust_feedback_rule"], "current_payoff_vs_prior_mean")
         self.assertEqual(summary["initial_eligible_trust_mean"], 0.6)
         self.assert_number(history[-1]["eligible_trust_mean"], summary["final_eligible_trust_mean"])
         self.assertAlmostEqual(summary["time_mean_eligible_trust"],
@@ -95,6 +99,31 @@ class TrustIntegrationTests(BatchFixtureTests):
             field = f"trust_{direction}_feedback"
             self.assertEqual(summary["total_" + field], sum(int(row[field]) for row in history))
 
+    def test_history_uses_current_payoff_and_prior_three_rounds_including_initial_seed(self):
+        _, metadata, history = self.run_single("prior_three", ["--steps", "6"])
+        initial = history[0]
+        self.assertEqual(initial["eligible_feedback_payoff_mean"], "")
+        self.assertEqual(initial["eligible_feedback_reference_mean"], "")
+        self.assert_number(initial["eligible_aspiration_mean"], float(initial["eligible_mean_payoff"]))
+
+        # 固定资格组的均值与时间均值可交换，直接用输出收益重建每人的参考均值。
+        recent = [float(initial["eligible_mean_payoff"])]
+        differs_from_current_including_mean = False
+        for row in history[1:]:
+            current = float(row["eligible_mean_payoff"])
+            prior_reference = math.fsum(recent[-3:]) / len(recent[-3:])
+            self.assert_number(row["eligible_feedback_payoff_mean"], current)
+            self.assert_number(row["eligible_feedback_reference_mean"], prior_reference)
+            # 反馈以后才写入本轮实际收益，为下一轮准备基准。
+            recent.append(current)
+            next_reference = math.fsum(recent[-3:]) / len(recent[-3:])
+            self.assert_number(row["eligible_aspiration_mean"], next_reference)
+            differs_from_current_including_mean |= abs(prior_reference - next_reference) > 1e-10
+        self.assertTrue(differs_from_current_including_mean)
+        for field in ("eligible_feedback_payoff_mean", "eligible_feedback_reference_mean",
+                      "eligible_aspiration_mean"):
+            self.assert_number(history[-1][field], metadata["summary"]["final_" + field])
+
     def test_zero_trust_learning_reproduces_fixed_probability_decisions(self):
         for probability in (0, 0.6, 1):
             with self.subTest(initial_trust=probability):
@@ -105,6 +134,7 @@ class TrustIntegrationTests(BatchFixtureTests):
                 fixed_dir, fixed, fixed_history = self.run_single(
                     f"fixed_{probability}", ["--advice-mode", "fixed", "--lambda", str(probability)],
                 )
+                self.assertIsNone(fixed["summary"]["trust_feedback_rule"])
                 self.assertEqual((adaptive_dir / "final_grid.csv").read_bytes(),
                                  (fixed_dir / "final_grid.csv").read_bytes())
                 for actual, expected in zip(adaptive_history, fixed_history):
@@ -114,16 +144,18 @@ class TrustIntegrationTests(BatchFixtureTests):
                         self.assertEqual(actual[field], expected[field], field)
                     self.assert_number(actual["eligible_trust_mean"], probability)
                     self.assertEqual(expected["eligible_trust_mean"], "")
+                    self.assertEqual(expected["eligible_feedback_reference_mean"], "")
                 for name in ("final_cooperation_rate", "tail_mean_cooperation_rate",
                              "eligible_cumulative_mean_payoff", "delta_population_cumulative_mean_payoff"):
                     self.assertEqual(adaptive["summary"][name], fixed["summary"][name])
 
     def scan_arguments(self, output, workers=1):
         return [
-            "--scan", "--advice-mode", "adaptive", "--workers", str(workers), "--repeats", "1",
+            "--scan", "--scan-history-mode", "full", "--scan-history-every", "1",
+            "--advice-mode", "adaptive", "--workers", str(workers), "--repeats", "1",
             "--size", "3", "--steps", "3", "--b-values", "1.5", "--k-values", "0.1",
             "--p-values", "0.5", "--seed-values", "13", "--initial-trust-values", "0.2", "0.8",
-            "--trust-learning-rate-values", "0", "0.2", "--aspiration-learning-rate-values", "0", "0.3",
+            "--trust-learning-rate-values", "0", "0.2", "--trust-payoff-window", "3",
             "--initial-cooperation", "0.5", "--boundary", "periodic", "--update-mode", "synchronous",
             "--paired-fermi-control", "--early-average-steps", "2", "--tail-average-steps", "2",
             "--report-every", "0", "--advisor-batch", str(self.batch), "--no-scan-save-details",
@@ -141,20 +173,24 @@ class TrustIntegrationTests(BatchFixtureTests):
             parallel = self.run_scan(self.root / "parallel", workers=2)
         self.assertEqual((serial / "summary.csv").read_bytes(), (parallel / "summary.csv").read_bytes())
         metadata = read_json(parallel / "scan_config.json")
-        self.assertEqual(metadata["total_runs"], 8)
-        self.assertEqual(metadata["completed_run_ids"], list(range(1, 9)))
+        self.assertEqual(metadata["total_runs"], 4)
+        self.assertEqual(metadata["completed_run_ids"], list(range(1, 5)))
         self.assertEqual(metadata["actual_workers"], 2)
         self.assertNotIn("lambda_prob", metadata["scan_values"])
         self.assertEqual(metadata["scan_values"]["initial_trust"], [0.2, 0.8])
         self.assertEqual(metadata["scan_values"]["trust_learning_rate"], [0, 0.2])
-        self.assertEqual(metadata["scan_values"]["aspiration_learning_rate"], [0, 0.3])
+        self.assertNotIn("aspiration_learning_rate", metadata["scan_values"])
         rows = read_csv(parallel / "summary.csv")
-        self.assertEqual(len(rows), 8)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(len({(row["initial_trust"], row["trust_learning_rate"]) for row in rows}), 4)
         for row in rows:
             self.assertEqual(row["advice_mode"], "adaptive")
+            self.assertEqual(row["trust_feedback_rule"], "current_payoff_vs_prior_mean")
+            self.assertNotIn("aspiration_learning_rate", row)
             self.assertEqual({path.name for path in (parallel / row["output_dir"]).iterdir()},
                              {"history.csv", "final_grid.csv"})
             self.assertNotEqual(row["final_eligible_trust_mean"], "")
+            self.assertNotEqual(row["final_eligible_feedback_reference_mean"], "")
             for filename in ("history.csv", "final_grid.csv"):
                 self.assertEqual((serial / row["output_dir"] / filename).read_bytes(),
                                  (parallel / row["output_dir"] / filename).read_bytes())
@@ -216,10 +252,10 @@ class TrustIntegrationTests(BatchFixtureTests):
         output = self.root / "source_defaults"
         with patch.multiple(
             runner, ADVICE_MODE="adaptive", INITIAL_TRUST=0.6, TRUST_LEARNING_RATE=0.25,
-            ASPIRATION_LEARNING_RATE=0.4, SCAN_ENABLED=True, SCAN_B_VALUES=[1.5],
+            SCAN_ENABLED=True, SCAN_B_VALUES=[1.5],
             SCAN_K_VALUES=[0.1], SCAN_P_VALUES=[0.5], SCAN_SEEDS=None,
             SCAN_INITIAL_TRUST_VALUES=[0.4, 0.7], SCAN_TRUST_LEARNING_RATES=[0.25],
-            SCAN_ASPIRATION_LEARNING_RATES=[0.4], SCAN_LAMBDA_VALUES=[0, 0.1, 0.5, 1],
+            SCAN_LAMBDA_VALUES=[0, 0.1, 0.5, 1], TRUST_PAYOFF_WINDOW=3,
             SIZE=3, STEPS=3, REPEATS=1, NUM_WORKERS=1, SEED=13, INITIAL_COOPERATION=0.5,
             BOUNDARY="periodic", UPDATE_MODE="synchronous", LLM_BATCH_DIR=self.batch,
             OUTPUT_DIR=output, REPORT_EVERY=0, SCAN_SAVE_DETAILS=False,
@@ -230,19 +266,18 @@ class TrustIntegrationTests(BatchFixtureTests):
         self.assertEqual(len(rows), 2)
         self.assertEqual({float(row["initial_trust"]) for row in rows}, {0.4, 0.7})
         self.assertEqual({float(row["trust_learning_rate"]) for row in rows}, {0.25})
-        self.assertEqual({float(row["aspiration_learning_rate"]) for row in rows}, {0.4})
+        self.assertNotIn("aspiration_learning_rate", rows[0])
+        self.assertEqual({row["trust_payoff_window"] for row in rows}, {"3"})
         self.assertEqual({row["advice_mode"] for row in rows}, {"adaptive"})
 
     def test_invalid_or_ambiguous_trust_settings_fail_before_output_creation(self):
         invalid = [
             ["--initial-trust", "1.1"], ["--initial-trust", "nan"],
             ["--trust-learning-rate", "-0.1"], ["--trust-learning-rate", "inf"],
-            ["--aspiration-learning-rate", "1.1"], ["--aspiration-learning-rate", "nan"],
             ["--advice-mode", "unknown"], ["--update-mode", "asynchronous"],
             ["--lambda", "0"], ["--lambda-values", "0", "1"],
             ["--initial-trust-values", "0.2", "0.8"],
             ["--trust-learning-rate-values", "0.1"],
-            ["--aspiration-learning-rate-values", "0.1"],
         ]
         for index, arguments in enumerate(invalid):
             with self.subTest(arguments=arguments):
@@ -254,7 +289,6 @@ class TrustIntegrationTests(BatchFixtureTests):
         for flag, values in (
             ("--initial-trust-values", ["0.2", "0.2"]),
             ("--trust-learning-rate-values", ["-0.1"]),
-            ("--aspiration-learning-rate-values", ["inf"]),
             ("--lambda-values", ["0", "1"]),
         ):
             output = self.root / ("invalid_scan_" + flag[2:])
@@ -262,4 +296,22 @@ class TrustIntegrationTests(BatchFixtureTests):
                 with self.assertRaises(SystemExit) as raised:
                     runner.main(self.scan_arguments(output) + [flag] + values)
                 self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(output.exists())
+
+    def test_removed_beta_cli_is_rejected_in_single_and_scan_without_writing_outputs(self):
+        for flag in ("--aspiration-learning-rate", "--aspiration-learning-rate-values"):
+            for mode in ("single", "scan"):
+                output = self.root / (mode + "_removed_" + flag[2:])
+                arguments = self.scan_arguments(output) if mode == "scan" else None
+                errors = io.StringIO()
+                with self.subTest(flag=flag, mode=mode), redirect_stdout(io.StringIO()), \
+                        redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+                    if arguments is None:
+                        # invoke 会重定向 stderr，因此此处构造完整 argv 以检查错误文案。
+                        runner.main(["--single", "--workers", "1", "--repeats", "1",
+                                     "--output-dir", str(output), flag, "0.2"])
+                    else:
+                        runner.main(arguments + [flag, "0.2"])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(flag, errors.getvalue())
                 self.assertFalse(output.exists())

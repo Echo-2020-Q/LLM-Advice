@@ -8,6 +8,7 @@ TRUST_POINT_FIELDS = (
     "eligible_trust_mean", "eligible_trust_std", "eligible_trust_min", "eligible_trust_max",
     "eligible_low_trust_fraction", "eligible_high_trust_fraction", "eligible_aspiration_mean",
     "eligible_feedback_payoff_mean",
+    "eligible_feedback_reference_mean",
 ) + tuple(f"eligible_trust_bin_{index}" for index in range(10))
 TRUST_FEEDBACK_FIELDS = (
     "trust_positive_feedback", "trust_negative_feedback", "trust_zero_feedback",

@@ -100,7 +100,8 @@ class ParallelRunTests(unittest.TestCase):
 
     def invoke(self, arguments):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            return runner.main(["--advice-mode", "fixed"] + arguments)
+            return runner.main(["--advice-mode", "fixed", "--scan-history-mode", "full",
+                                "--scan-history-every", "1"] + arguments)
 
     def scan_arguments(self, output, workers, details):
         return [

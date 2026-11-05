@@ -16,7 +16,7 @@ class AdaptiveTrustTests(unittest.TestCase):
     def config(self, **changes):
         values = dict(size=3, seed=29, update_mode="synchronous",
                       advice_mode="adaptive", initial_trust=0.5,
-                      trust_learning_rate=0.2, aspiration_learning_rate=0.2)
+                      trust_learning_rate=0.2)
         values.update(changes)
         return SimulationConfig(**values)
 
@@ -33,6 +33,8 @@ class AdaptiveTrustTests(unittest.TestCase):
         self.assertEqual(model.aspiration_grid,
                          tuple(tuple(model.payoff(r, c) for c in range(3))
                                for r in range(3)))
+        self.assertIsNone(model.feedback_reference_grid)
+        self.assertIsNone(model.trust_payoff_grid)
         for row in range(3):
             for col in range(3):
                 self.assertEqual(model.trust_grid[row][col],
@@ -43,27 +45,29 @@ class AdaptiveTrustTests(unittest.TestCase):
                 snapshot[0][0] = 0.0
         self.assertIsNone(model.trust_statistics()["eligible_advice_rate"])
 
-    def test_new_grid_payoff_uses_old_reference_even_with_beta_one(self):
+    def test_new_grid_payoff_uses_prior_reference_before_history_is_updated(self):
         # 初态全 C；建议让中心变 D，其他人仍 C。角落收益不变，
         # 中心获益，四个正交邻居受损，同策略建议也必须获得反馈。
         model = self.model(("CCC", "CCC", "CCC"),
                            lambda context: "D" if context.position == (1, 1) else "C",
-                           force_adoption=True, aspiration_learning_rate=1.0)
+                           force_adoption=True)
         old_trust = model.trust_grid
         old_reference = model.aspiration_grid
         stats = model.step()
         self.assertEqual(stats.advice_used, 9)
         self.assertEqual(stats.strategy_changes, 1)
         self.assertEqual(model.trust_grid[1][1], 0.6)
-        self.assertEqual(model.aspiration_grid[1][1], 6.0)
+        self.assertEqual(model.trust_payoff_grid[1][1], 6.0)
+        self.assertEqual(model.aspiration_grid[1][1], 5.0)
         for row, col in ((0, 1), (1, 0), (1, 2), (2, 1)):
             self.assertEqual(model.trust_grid[row][col], 0.4)
-            self.assertEqual(model.aspiration_grid[row][col], 3.0)
+            self.assertEqual(model.aspiration_grid[row][col], 3.5)
         for row, col in ((0, 0), (0, 2), (2, 0), (2, 2)):
             self.assertEqual(model.trust_grid[row][col], 0.5)
             self.assertEqual(model.aspiration_grid[row][col], 4.0)
         self.assertEqual(old_trust, ((0.5,) * 3,) * 3)
         self.assertEqual(old_reference, ((4.0,) * 3,) * 3)
+        self.assertEqual(model.feedback_reference_grid, old_reference)
         self.assertTrue(all(all(row) for row in model.last_advice_grid))
         feedback = model.trust_statistics()
         self.assertEqual(feedback["trust_positive_feedback"], 1)
@@ -80,47 +84,55 @@ class AdaptiveTrustTests(unittest.TestCase):
         negative.step()
         self.assertEqual(positive.trust_grid, ((0.6,) * 3,) * 3)
         self.assertEqual(negative.trust_grid, ((0.4,) * 3,) * 3)
-        self.assertEqual(positive.aspiration_grid, ((0.8,) * 3,) * 3)
-        self.assertEqual(negative.aspiration_grid, ((3.2,) * 3,) * 3)
+        self.assertEqual(positive.aspiration_grid, ((2.0,) * 3,) * 3)
+        self.assertEqual(negative.aspiration_grid, ((2.0,) * 3,) * 3)
         self.assertEqual(positive.trust_statistics()["trust_positive_feedback"], 9)
         self.assertEqual(negative.trust_statistics()["trust_negative_feedback"], 9)
 
-    def test_beta_zero_keeps_reference_but_still_updates_trust(self):
-        model = self.model(("CCC",) * 3, lambda _: "D", force_adoption=True,
-                           aspiration_learning_rate=0.0)
+    def test_repeated_equal_payoffs_become_zero_feedback_when_old_history_expires(self):
+        model = self.model(("CCC",) * 3, lambda _: "D", force_adoption=True)
+        for trust, reference in ((0.4, 2.0), (0.32, 4 / 3), (0.256, 0.0)):
+            model.step()
+            for row in model.trust_grid:
+                for value in row:
+                    self.assertAlmostEqual(value, trust)
+            for row in model.aspiration_grid:
+                for value in row:
+                    self.assertAlmostEqual(value, reference)
+            self.assertEqual(model.trust_statistics()["trust_negative_feedback"], 9)
+        previous = model.trust_grid
         model.step()
-        self.assertEqual(model.trust_grid, ((0.4,) * 3,) * 3)
-        self.assertEqual(model.aspiration_grid, ((4.0,) * 3,) * 3)
-        model.step()
-        for row in model.trust_grid:
-            for value in row:
-                self.assertAlmostEqual(value, 0.32)
-        self.assertEqual(model.trust_statistics()["trust_negative_feedback"], 9)
+        self.assertEqual(model.trust_grid, previous)
+        self.assertEqual(model.trust_statistics()["trust_zero_feedback"], 9)
+        self.assertEqual(model.feedback_reference_grid, ((0.0,) * 3,) * 3)
 
     def test_zero_trust_never_requests_but_all_references_continue_updating(self):
         def forbidden(_):
             raise AssertionError("零信任不应请求建议")
 
         grid = ("CDC", "CCD", "DDC")
-        model = self.model(grid, forbidden, initial_trust=0.0,
-                           aspiration_learning_rate=1.0)
+        model = self.model(grid, forbidden, initial_trust=0.0)
         old_reference = model.aspiration_grid
+        past = [old_reference]
         fixed = SpatialPrisonersDilemma(replace(model.config, advice_mode="fixed",
                                                 lambda_prob=0.0), initial_grid=grid)
         for _ in range(5):
             self.assertEqual(model.step(), fixed.step())
             self.assertEqual(model.grid, fixed.grid)
             self.assertEqual(model.trust_grid, ((0.0,) * 3,) * 3)
-            self.assertEqual(model.aspiration_grid,
-                             tuple(tuple(model.payoff(r, c) for c in range(3))
-                                   for r in range(3)))
+            past.append(tuple(tuple(model.payoff(r, c) for c in range(3))
+                              for r in range(3)))
+            for row in range(3):
+                for col in range(3):
+                    window = past[-3:]
+                    self.assertAlmostEqual(model.aspiration_grid[row][col],
+                                           math.fsum(p[row][col] for p in window) / len(window))
             self.assertEqual(model.trust_statistics()["trust_positive_feedback"], 0)
         self.assertNotEqual(model.aspiration_grid, old_reference)
 
     def test_no_advice_falls_back_without_trust_feedback(self):
         grid = ("CDC", "CCD", "DDC")
-        model = self.model(grid, lambda _: None, initial_trust=1.0,
-                           aspiration_learning_rate=1.0)
+        model = self.model(grid, lambda _: None, initial_trust=1.0)
         fixed = SpatialPrisonersDilemma(replace(model.config, advice_mode="fixed",
                                                 lambda_prob=0.0), initial_grid=grid)
         for _ in range(5):
@@ -174,7 +186,7 @@ class AdaptiveTrustTests(unittest.TestCase):
 
     def test_no_eligible_people_have_no_group_statistics_but_reference_updates(self):
         model = self.model(("CDC", "CCD", "DDC"), lambda _: "D",
-                           llm_access_fraction=0.0, aspiration_learning_rate=1.0)
+                           llm_access_fraction=0.0)
         initial = model.aspiration_grid
         model.step()
         self.assertNotEqual(initial, model.aspiration_grid)
@@ -204,6 +216,8 @@ class AdaptiveTrustTests(unittest.TestCase):
                                        advisor=lambda context: context.strategy)
         self.assertIsNone(model.trust_grid)
         self.assertIsNone(model.aspiration_grid)
+        self.assertIsNone(model.feedback_reference_grid)
+        self.assertIsNone(model.trust_payoff_grid)
         statistics = model.trust_statistics()
         for key, value in statistics.items():
             self.assertEqual(value, 0 if key.startswith("trust_") else None)
@@ -212,7 +226,7 @@ class AdaptiveTrustTests(unittest.TestCase):
         self.assertGreater(stats.advice_used, 0)
 
     def test_learning_parameter_validation_and_adaptive_synchronous_requirement(self):
-        for name in ("initial_trust", "trust_learning_rate", "aspiration_learning_rate"):
+        for name in ("initial_trust", "trust_learning_rate"):
             for value in (-0.1, 1.1, math.nan, math.inf, -math.inf):
                 with self.subTest(name=name, value=value), self.assertRaises(ValueError):
                     self.config(**{name: value})
@@ -221,6 +235,38 @@ class AdaptiveTrustTests(unittest.TestCase):
         for fraction in (0.0, 1.0):
             with self.assertRaises(ValueError):
                 self.config(update_mode="asynchronous", llm_access_fraction=fraction)
+
+    def test_fixed_random_trajectory_does_not_depend_on_learning_parameters(self):
+        def advisor(context):
+            return "C" if context.cooperating_neighbors < 2 else "D"
+
+        config = self.config(advice_mode="fixed", lambda_prob=0.4,
+                             initial_trust=0.1, trust_learning_rate=0.0,
+                             trust_payoff_window=1)
+        first = SpatialPrisonersDilemma(config, advisor=advisor)
+        second = SpatialPrisonersDilemma(
+            replace(config, initial_trust=0.9, trust_learning_rate=1.0,
+                    trust_payoff_window=3), advisor=advisor)
+        for _ in range(10):
+            self.assertEqual(first.step(), second.step())
+            self.assertEqual(first.grid, second.grid)
+            self.assertEqual(first.last_advice_grid, second.last_advice_grid)
+
+    def test_boundary_learning_rates_keep_trust_in_closed_unit_interval(self):
+        for alpha in (0.0, 0.2, 1.0):
+            for initial in (0.0, 0.5, 1.0):
+                with self.subTest(alpha=alpha, initial=initial):
+                    model = self.model(
+                        ("CCC",) * 3,
+                        lambda context: "D" if context.round % 2 else "C",
+                        force_adoption=True, trust_learning_rate=alpha,
+                        initial_trust=initial)
+                    for _ in range(8):
+                        model.step()
+                        for row in model.trust_grid:
+                            for value in row:
+                                self.assertGreaterEqual(value, 0.0)
+                                self.assertLessEqual(value, 1.0)
 
 
 if __name__ == "__main__":

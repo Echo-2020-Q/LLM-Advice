@@ -5,14 +5,16 @@
     python main/SPD/run_experiment.py
 仍支持命令行覆盖代码中的参数，例如：
     python main/SPD/run_experiment.py --single --advice-mode adaptive --b 1.5 --initial-trust 0.5
-默认动态信任扫描 b、K、P、T0、α、β；fixed 模式扫描 b、K、λ、P。
+默认动态信任扫描 b、K、P、T0、α；fixed 模式扫描 b、K、λ、P。
 SCAN_NAME 可设置扫描目录后缀：scan_年月日_时分秒_自定义名称；None 表示不加后缀。
 也可运行：
     python main/SPD/run_experiment.py --scan --advice-mode fixed --b-values 1.5 --lambda-values 0 0.2
 REPEATS 控制每组参数运行多少次，单组和扫描模式均生效，也可传入 --repeats。
 NUM_WORKERS 控制并行进程数，也可传入 --workers；1 为串行，多个独立实验可并行。
 终端进度显示已用时间和预计剩余时间；批次按整体完成速度估算，单次实验按完成步数估算。
-扫描子目录默认只保存 history.csv 和 final_grid.csv；SCAN_SAVE_DETAILS=True 可恢复完整记录。
+扫描默认history.csv保存18列核心指标、每10轮一行，并保存final_grid.csv。
+SCAN_HISTORY_MODE控制full/compact/none；启用history时，按SCAN_HISTORY_EVERY采样且始终保存初末态。
+SCAN_SAVE_DETAILS=True另存配置、初始网格、建议来源等明细；history模式独立设置。
 summary.csv 无法替换时保存备用 CSV 并继续；批次配置的 latest_summary_file 指向最新完整汇总。
 默认配对运行同初态、同资格位置的纯 Fermi 对照，在原有 CSV 中记录分组收益和配对差值。
 单值 --b/--k/--lambda/--p/--seed 只用于单组模式；扫描模式使用对应的 --*-values。
@@ -25,7 +27,8 @@ summary.csv 无法替换时保存备用 CSV 并继续；批次配置的 latest_s
 建议匹配不使用 b，不同 b 的实验共用同一批数据；博弈收益仍使用各组实验的 b。
 实际有人可咨询时，本地策略表要求四邻居周期边界。
 fixed的λ=0、adaptive的T0=0或实际资格人数为0时不读取建议数据。
-history.csv 的建议/Fermi/策略变化计数均是本轮计数；round=0 为初始状态。
+history.csv的计数均是被记录当轮的计数，不是记录间隔内累计；round=0为初始状态。
+summary.csv所有统计始终逐轮计算，不受history记录模式和间隔影响。
 每次运行创建独立输出目录，不覆盖已有实验。更换 SEED 可进行独立重复实验。
 """
 
@@ -51,7 +54,7 @@ SIZE = 50
 
 # 仿真时间步数，必须为非负整数；0 表示只保存初始状态。
 # 异步模式每步随机抽取 L² 次个体（有放回）；同步模式每步所有个体更新一次。
-STEPS = 10000
+STEPS = 5000
 
 # 每组参数独立运行的次数，必须为正整数；单组模式和扫描模式都生效。
 # 例如 REPEATS=10 表示每组运行10次，每次都演化 STEPS 步。
@@ -87,21 +90,23 @@ ADVICE_MODE = "adaptive"
 # T0=0 完全不采纳且无法自行恢复信任；无资格者始终 Fermi，不计入平均信任。
 INITIAL_TRUST = 0.5
 
-# 信任学习率 α，范围 [0,1]；实际采纳后，按最近W轮平均收益相对旧参考收益的正负更新。
-# 正反馈：T <- T + α(1-T)；负反馈：T <- (1-α)T；相等或未采纳则保持。
+# 信任学习率 α，范围 [0,1]；实际采纳后，比较当前轮收益和此前W条收益的历史平均。
+# 超过正阈值：T <- T + α(1-T)；低于负阈值：T <- (1-α)T；阈值内或未采纳保持。
 # 0 表示冻结信任，可作为相同初始采纳概率的固定对照；1 表示一次正/负反馈就达到1/0。
 TRUST_LEARNING_RATE = 0.1
 
-# 参考收益平滑系数 β，范围 [0,1]，与旧 λ 是不同参数。
-# A0=每个位置在初始网格下的自身收益；之后每轮 A <- (1-β)A + β×最近W轮平均收益。
-# 所有位置每轮更新A（包括没有采纳建议的轮次）；先用旧A更新信任，再更新A。
-# 0 表示参考收益一直保持初值；1 表示下一轮直接以刚结束的W轮均值为基准。
-ASPIRATION_LEARNING_RATE = 0.1
+# 收益反馈的变化阈值ε，必须为有限非负数，单位与个人四邻居收益相同。
+# 只有 Δ>ε 或 Δ<-ε 才更新信任；|Δ|<=ε（包含恰好±ε）按无变化处理。
+# 0.01可忽略很小的收益波动；设为0恢复按严格正/负号反馈。
+# 仅影响信任反馈分类，历史收益窗口仍每轮更新；固定采纳模式不使用此阈值。
+TRUST_FEEDBACK_THRESHOLD = 0.01
 
-# 信任反馈所用的收益窗口W，必须为正整数；3表示最近3个已完成回合（包含刚结束的本轮）。
-# 第1轮只用第1轮收益，第2轮用第1、2轮平均，第3轮起取最近3轮；初态round0不入窗口。
-# 此均值同时用于信任反馈及参考收益更新；每轮均记录原始收益，包括未采纳的轮次。
-# Fermi决策和现有收益/福利统计仍使用原始当前收益。改为1可恢复单轮收益反馈。
+# 反馈比较基准的历史窗口W，必须为正整数；3表示当前轮之前的3条个人收益，不含当前轮。
+# 初始收益π(0)作为第一条历史：第1轮与π(0)比，第2轮与mean[π(0),π(1)]比，
+# 第3轮与mean[π(0),π(1),π(2)]比，第4轮起与此前3个已完成回合平均比。
+# 每轮先用当前收益减历史均值更新信任，再把当前收益加入历史；未采纳的轮次也会入窗。
+# 参考收益A直接是历史窗口均值，取消β指数平滑；W=1表示当前收益与上一轮收益比较。
+# Fermi决策和现有收益/福利统计始终使用原始当前收益。
 TRUST_PAYOFF_WINDOW = 3
 
 # 具备 LLM 咨询资格的个体比例，范围 [0, 1]；不是收益矩阵中的惩罚收益 P=0。
@@ -117,7 +122,7 @@ P = 0.2
 # 3×3包含本人和周围八格，保留方向；四角只供观察，收益/Fermi仍用四邻居。
 # 旧批次的 b 仅作来源记录，不参与建议匹配；各实验的博弈收益仍由 B/SCAN_B_VALUES 决定。
 LLM_BATCH_DIR = (Path(__file__).resolve().parents[2] / "logs" / "GPT_Multistepsa"
-                 / "20261016_173605_GPT5.5")
+                 / "20261016_173605_GPT5.5_2次")
 
 # 各个体初始选择合作 C 的概率，范围 [0, 1]；否则初始化为背叛 D。
 # 0 为全 D，1 为全 C；随机初始化的实际合作比例不一定恰好等于该值。
@@ -137,17 +142,17 @@ BOUNDARY = "periodic"
 UPDATE_MODE = "synchronous"
 
 # 结果根目录，默认是本文件旁的 results 文件夹；可改为 Path("你的目录")。
-# 每次运行会在其下新建独立目录；扫描子目录的文件数量由 SCAN_SAVE_DETAILS 控制。
+# 每次运行会新建独立目录；扫描子目录文件由 SCAN_SAVE_DETAILS 和 SCAN_HISTORY_MODE 控制。
 OUTPUT_DIR = Path(__file__).resolve().parent / "results"
 
 # 每隔多少个时间步打印一次进度，必须为非负整数；0 表示不打印中途进度。
-# 仅影响控制台显示，逐步统计仍全部保存到 history.csv。
+# 仅影响控制台显示；history.csv的记录列与间隔由下方SCAN_HISTORY参数单独控制。
 # 多进程时仅由主进程打印每次实验完成的进度，避免各进程的逐步输出混杂。
 REPORT_EVERY = 100
 
 # 是否启用参数扫描：False 只运行上方单组参数；True 遍历下面列表的所有组合。
 # fixed 总次数 = b 值数 × K 值数 × λ 值数 × P 值数 × REPEATS。
-# adaptive 总次数 = b 值数 × K 值数 × P 值数 × T0值数 × α值数 × β值数 × REPEATS。
+# adaptive 总次数 = b 值数 × K 值数 × P 值数 × T0值数 × α值数 × REPEATS。
 SCAN_ENABLED = True
 
 # 扫描结果目录的自定义后缀，例如 "Qwen实验"、"对照组"；只影响扫描批次的目录名。
@@ -156,13 +161,27 @@ SCAN_ENABLED = True
 # 同一秒、同名目录已经存在时，自动追加 _2、_3 等编号，避免覆盖已有结果。
 SCAN_NAME = "2次gpt微扫描"
 
-# 扫描时是否保存完整明细；只影响输出文件，不改变仿真过程和汇总统计。
-# False：每个子目录只保存 history.csv（逐轮统计）和 final_grid.csv（最终策略网格）。
+# 扫描时是否额外保存完整明细；不改变仿真过程和汇总统计。
+# False：每个子目录保存 final_grid.csv，以及按SCAN_HISTORY_MODE设置保存的history.csv。
 # 参数、种子和汇总结果统一保存在扫描根目录的 scan_config.json、summary.csv。
 # True：额外保存 config.json、initial_grid.csv、llm_access_grid.csv，
 # 使用本地建议时还保存 advisor_table.csv、advisor_usage.csv。
 # 单组模式（含 REPEATS 重复）始终保存完整明细；此设置仅对之后新运行的扫描生效。
 SCAN_SAVE_DETAILS = False
+
+# 扫描的历史记录内容："compact"保存18列核心指标；"full"保存原有全部52列。
+# "none"完全不创建history.csv，仅保存最终网格及批次summary.csv，可用于大规模汇总扫描。
+# compact保留合作率、分组收益、Fermi对照、平均/标准差信任、采纳率、参考值和反馈计数。
+# 累计收益、终态信任分布、灭绝时间、前期/末期均值等汇总仍逐轮计算并写入summary.csv。
+# 此设置只影响扫描；单组模式（含重复实验）始终使用full并每轮记录。
+SCAN_HISTORY_MODE = "compact"
+
+# 扫描history.csv每隔多少轮写一行，必须为正整数；10表示记录0、10、20……以及成功末轮。
+# 无论间隔多少，初态round0与成功末态都保存；1表示每轮记录，none模式不创建历史文件。
+# 例如5000轮、间隔10时保存501行（不计表头）；中间省略的轮次不会影响汇总统计。
+# 稀疏记录中的advice_used/反馈计数仅属于该轮，精确总计应读取summary.csv。
+# 需要原有全部逐轮数据时，同时设SCAN_HISTORY_MODE="full"、SCAN_HISTORY_EVERY=1。
+SCAN_HISTORY_EVERY = 10
 
 # 要扫描的 b 值，每个值必须 > 1；扫描时替代上方 B。
 # 不同 b 共用本地 LLM 建议表，仅改变博弈收益及依赖收益的 Fermi 更新概率。
@@ -183,9 +202,6 @@ SCAN_INITIAL_TRUST_VALUES = [INITIAL_TRUST]
 
 # adaptive模式扫描的信任学习率α，各值范围[0,1]；例如 [0.01, 0.1, 0.5]。
 SCAN_TRUST_LEARNING_RATES = [TRUST_LEARNING_RATE]
-
-# adaptive模式扫描的参考收益学习率β，各值范围[0,1]；例如 [0.01, 0.1, 1.0]。
-SCAN_ASPIRATION_LEARNING_RATES = [ASPIRATION_LEARNING_RATE]
 
 # 要扫描的资格比例 P，各值须在 [0, 1]；如 [0.0, 0.2, 0.5, 1.0]。
 # [P] 表示不扫描此参数，只使用上方 P；每组实验都单独选定并保存固定资格网格。
@@ -226,6 +242,7 @@ if __package__ in (None, ""):
     from SPD.parallel_execution import ParallelRunError, run_parallel
     from SPD.summary_writer import SummaryWriter
     from SPD.trust_metrics import TrustTracker, TRUST_SUMMARY_FIELDS
+    from SPD.history_writer import HistoryWriter, COMPACT_HISTORY_FIELDS
 else:
     from .llm_advisor import EmpiricalAdvisor, request_advice
     from .simulation import SimulationConfig, SpatialPrisonersDilemma
@@ -233,6 +250,7 @@ else:
     from .parallel_execution import ParallelRunError, run_parallel
     from .summary_writer import SummaryWriter
     from .trust_metrics import TrustTracker, TRUST_SUMMARY_FIELDS
+    from .history_writer import HistoryWriter, COMPACT_HISTORY_FIELDS
 
 
 GAIN_FIELDS = tuple(
@@ -241,6 +259,10 @@ GAIN_FIELDS = tuple(
 ) + ("time_mean_cooperation_rate",)
 CONTROL_OUTCOME_FIELDS = (
     "final_cooperation_rate", "final_average_payoff", "tail_mean_cooperation_rate", "tail_mean_payoff",
+)
+HISTORY_SAMPLING_SEMANTICS = (
+    "snapshots_at_selected_rounds; always_initial_and_successful_final; "
+    "counters_are_for_sampled_round_only_not_interval_totals; summary_uses_all_rounds"
 )
 STATISTICS_SEMANTICS = {
     "payoffs": "每完整步轮末，每个位置测一次当前邻居收益；累计round1..T，不计round0，不改变更新收益。",
@@ -258,9 +280,11 @@ STATISTICS_SEMANTICS = {
     "final_extinction": "final_extinction_start_round仅在末态全D时记录最后连续全D段的起点。",
     "replicates": "每行对应一组参数的一次重复；先取同seed配对差值，格点和时间步不当作独立重复。",
     "trust_rule": "adaptive仅同步：有资格者以T采纳；有效建议即使策略未变也记m=1，None回退Fermi记m=0。",
-    "trust_feedback": "最近W轮(包含本轮)个人原始收益平均减旧A；仅m=1时按严格正/负/零更新T。无容差、无强制探索。",
-    "trust_payoff_window": "W=trust_payoff_window，round0不入窗口，不足W用已完成轮数；Fermi与福利指标用原始收益。",
-    "aspiration": "A0为每位置初始原始收益；每轮反馈后用最近W轮均值按beta平滑，不受是否采纳影响。",
+    "trust_feedback": "Δ为当前个人收益减此前W条历史均值；仅m=1且Δ>阈值或Δ<-阈值更新T，边界及内部无变化。",
+    "trust_feedback_threshold": "ε=trust_feedback_threshold；|Δ|<=ε算zero_feedback，仅过滤反馈，不跳过历史更新。",
+    "trust_payoff_window": "W=trust_payoff_window，历史初始含π0；不足W按已有历史平均，反馈后才加入当前轮收益。",
+    "aspiration": "A为个人历史窗口的等权均值，无β指数平滑；所有轮次均更新历史，不受是否采纳影响。",
+    "feedback_reference": "eligible_feedback_reference_mean为本轮实际使用的旧基准；eligible_aspiration_mean为轮末供下轮用的新基准。",
     "trust_statistics": "T/A和10档信任分布仅统计固定资格人群；history的T/A为轮末值，供下一轮决策。",
     "adoption_rate": "eligible_advice_rate为本轮实际有效采纳次数/有资格者决策次数；初态或分母0为空。",
     "trust_windows": "信任/采纳率时间均值排除round0，早末窗口同福利统计；固定模式T/A为空、反馈计数0。",
@@ -280,10 +304,10 @@ def build_parser():
     parser.add_argument("--initial-trust", type=float, default=None, help="动态信任初值T0，[0,1]")
     parser.add_argument("--trust-learning-rate", type=float, default=None,
                         help="信任学习率α，[0,1]")
-    parser.add_argument("--aspiration-learning-rate", type=float, default=None,
-                        help="参考收益平滑系数β，[0,1]")
+    parser.add_argument("--trust-feedback-threshold", type=float, default=TRUST_FEEDBACK_THRESHOLD,
+                        help="信任收益变化阈值ε，有限非负；|Δ|<=ε时不更新信任")
     parser.add_argument("--trust-payoff-window", type=int, default=TRUST_PAYOFF_WINDOW,
-                        help="信任反馈的最近收益窗口W，正整数，包含本轮；不足W按实际轮数")
+                        help="当前轮之前的收益历史窗口W，正整数，不含当前；初始含π0，不足W按已有条数")
     # 单值默认延迟到构建配置时读取，以识别扫描时误传的单值参数。
     parser.add_argument("--b", type=float, default=None, help="单组模式的 T=b，默认使用代码中的 B")
     parser.add_argument("--k", type=float, default=None, help="单组模式的 K，默认使用代码中的 K")
@@ -309,13 +333,16 @@ def build_parser():
     parser.set_defaults(scan=SCAN_ENABLED)
     parser.add_argument("--scan-save-details", action=argparse.BooleanOptionalAction,
                         default=SCAN_SAVE_DETAILS,
-                        help="扫描时保存完整明细；--no-scan-save-details 仅保留逐轮统计和最终网格")
+                        help="扫描时额外保存配置/初始网格/建议表，history列和间隔由独立参数控制")
+    parser.add_argument("--scan-history-mode", choices=("full", "compact", "none"),
+                        default=SCAN_HISTORY_MODE, help="扫描历史记录：full全部列、compact核心列、none不保存")
+    parser.add_argument("--scan-history-every", type=int, default=SCAN_HISTORY_EVERY,
+                        help="扫描history每隔N轮记录，正整数，初态与成功末态始终保存")
     parser.add_argument("--b-values", type=float, nargs="+", help="扫描的 b 列表，覆盖 SCAN_B_VALUES")
     parser.add_argument("--k-values", type=float, nargs="+", help="扫描的 K 列表，覆盖 SCAN_K_VALUES")
     parser.add_argument("--lambda-values", type=float, nargs="+", help="fixed扫描的 λ 列表，覆盖 SCAN_LAMBDA_VALUES")
     parser.add_argument("--initial-trust-values", type=float, nargs="+", help="adaptive扫描的T0列表")
     parser.add_argument("--trust-learning-rate-values", type=float, nargs="+", help="adaptive扫描的α列表")
-    parser.add_argument("--aspiration-learning-rate-values", type=float, nargs="+", help="adaptive扫描的β列表")
     parser.add_argument("--p-values", type=float, nargs="+", help="扫描的资格比例 P 列表，覆盖 SCAN_P_VALUES")
     parser.add_argument("--seed-values", type=int, nargs="+",
                         help="扫描的显式种子列表，长度必须等于 repeats，覆盖 SCAN_SEEDS")
@@ -441,12 +468,16 @@ def prepare_configs(args):
         raise ValueError("SCAN_ENABLED 必须为 True 或 False。")
     if type(args.scan_save_details) is not bool:
         raise ValueError("SCAN_SAVE_DETAILS 必须为 True 或 False。")
+    if args.scan_history_mode not in ("full", "compact", "none"):
+        raise ValueError("SCAN_HISTORY_MODE 必须为 full、compact 或 none。")
+    if type(args.scan_history_every) is not int or args.scan_history_every < 1:
+        raise ValueError("SCAN_HISTORY_EVERY / --scan-history-every 必须为正整数。")
     adaptive = args.advice_mode == "adaptive"
     if adaptive and (args.lambda_prob is not None or args.lambda_values is not None):
         raise ValueError("adaptive模式直接使用个体信任T，请用 --initial-trust / --initial-trust-values；"
                          "--lambda / --lambda-values 仅用于 --advice-mode fixed。")
     trust_scan_arguments = (
-        args.initial_trust_values, args.trust_learning_rate_values, args.aspiration_learning_rate_values,
+        args.initial_trust_values, args.trust_learning_rate_values,
     )
     if not adaptive and any(value is not None for value in trust_scan_arguments):
         raise ValueError("信任参数扫描需要 --advice-mode adaptive；fixed模式请扫描 --lambda-values。")
@@ -461,9 +492,8 @@ def prepare_configs(args):
         "initial_trust": INITIAL_TRUST if args.initial_trust is None else args.initial_trust,
         "trust_learning_rate": (TRUST_LEARNING_RATE if args.trust_learning_rate is None
                                 else args.trust_learning_rate),
-        "aspiration_learning_rate": (ASPIRATION_LEARNING_RATE if args.aspiration_learning_rate is None
-                                     else args.aspiration_learning_rate),
         "trust_payoff_window": args.trust_payoff_window,
+        "trust_feedback_threshold": args.trust_feedback_threshold,
         "llm_access_fraction": P if args.llm_access_fraction is None else args.llm_access_fraction,
         "initial_cooperation": args.initial_cooperation,
         "seed": SEED if args.seed is None else args.seed,
@@ -490,7 +520,6 @@ def prepare_configs(args):
         for field, argument, source in (
             ("initial_trust", args.initial_trust_values, SCAN_INITIAL_TRUST_VALUES),
             ("trust_learning_rate", args.trust_learning_rate_values, SCAN_TRUST_LEARNING_RATES),
-            ("aspiration_learning_rate", args.aspiration_learning_rate_values, SCAN_ASPIRATION_LEARNING_RATES),
         ):
             # 显式列表优先，其次单值覆盖；否则读取代码中的对应扫描列表。
             scalar = getattr(args, field)
@@ -513,11 +542,13 @@ def difference(value, control):
     return value - control if value is not None and control is not None else None
 
 
-def welfare_history(stats, tracker, control_stats=None, control_tracker=None):
-    """同一步的实验、对照和差值合并在一行，不增加扫描子目录文件。"""
-    row = asdict(stats)
+def welfare_history(stats, tracker, control_stats=None, control_tracker=None, include_row=True):
+    """始终逐轮观测；只在需要写轨迹时构建实验、对照和差值行。"""
     values = tracker.observe(stats)
     baseline = control_tracker.observe(control_stats) if control_tracker is not None else {}
+    if not include_row:
+        return {}
+    row = asdict(stats)
     row.update(values)
     for name in ("cooperation_rate", "average_payoff"):
         value = getattr(control_stats, name) if control_stats is not None else None
@@ -550,8 +581,9 @@ def welfare_summary(tracker, control_tracker=None):
 
 def run_single(config, steps, output, report_every, tail_average_steps, advisor=None,
                parameter_set_id=1, repeat_index=1, repeats=1, save_details=True,
-               paired_control=True, early_average_steps=100, quiet=False, cancel_check=None):
-    """独立初始化并返回汇总；精简输出仅保存逐轮统计和最终网格。"""
+               paired_control=True, early_average_steps=100, quiet=False, cancel_check=None,
+               history_mode="full", history_every=1):
+    """逐轮计算完整汇总，按指定内容/间隔另存轨迹，支持完全关闭历史文件。"""
     started = time.perf_counter()
 
     def check_cancelled():
@@ -559,6 +591,7 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
             raise InterruptedError("批次已停止，取消本次实验。")
 
     check_cancelled()
+    history = HistoryWriter(output / "history.csv", history_mode, history_every, steps)
     simulation = SpatialPrisonersDilemma(config, advisor=advisor if advisor is not None else request_advice)
     # 让两模型各自用同种子生成初态，不传initial_grid，以保持初始化对随机流的正常消耗。
     control_config = replace(config, advice_mode="fixed", lambda_prob=0.0) if paired_control else None
@@ -582,6 +615,7 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
         "paired_fermi_control": paired_control,
         "control_config": asdict(control_config) if control_config is not None else None,
         "statistics_semantics": STATISTICS_SEMANTICS,
+        "trust_feedback_rule": config.trust_feedback_rule,
         "payoff_matrix": {"R": 1, "S": 0, "T": config.b, "P": 0},
         "advice_rule": ("fixed_eligible_subset_then_probability_trust; others_fermi; None_falls_back_to_fermi"
                         if config.advice_mode == "adaptive" else
@@ -601,6 +635,11 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
         "round_counters": "per_round; round_0_is_initial_state",
         "status": "running",
         "completed_steps": 0,
+        "history": {
+            "mode": history_mode, "every": history_every,
+            "fields": history.fields, "rows_written": 0,
+            "sampling_semantics": HISTORY_SAMPLING_SEMANTICS,
+        },
     }
     config_path = output / "config.json"
     if save_details:
@@ -608,7 +647,8 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
     if not quiet:
         print(f"输出目录：{output}", flush=True)
         mechanism = (f"动态信任 T0={config.initial_trust}，α={config.trust_learning_rate}，"
-                     f"β={config.aspiration_learning_rate}，收益窗口={config.trust_payoff_window}轮"
+                     f"历史窗口={config.trust_payoff_window}轮（不含本轮），"
+                     f"反馈阈值={config.trust_feedback_threshold}"
                      if config.advice_mode == "adaptive"
                      else f"固定咨询概率 λ={config.lambda_prob}")
         print(f"LLM 咨询资格：{config.llm_access_count}/{config.size ** 2} 个体，"
@@ -628,12 +668,14 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
         tail = deque(maxlen=tail_average_steps)
         control_tail = deque(maxlen=tail_average_steps)
         totals = dict(advice_requests=0, advice_used=0, fermi_updates=0, strategy_changes=0)
-        with (output / "history.csv").open("w", newline="", encoding="utf-8") as file:
-            initial_row = welfare_history(initial, tracker, control_final, control_tracker)
-            initial_row.update(trust_tracker.observe(initial.round))
-            writer = csv.DictWriter(file, fieldnames=list(initial_row))
-            writer.writeheader()
-            writer.writerow(initial_row)
+        with history:
+            record_initial = history.should_write(initial.round)
+            initial_row = welfare_history(initial, tracker, control_final, control_tracker,
+                                          include_row=record_initial)
+            initial_trust = trust_tracker.observe(initial.round)
+            if record_initial:
+                initial_row.update(initial_trust)
+                history.write(initial_row)
             for _ in range(steps):
                 # 在完整实验/对照步之间响应取消，保证保存的每一行仍是一对完整观测。
                 check_cancelled()
@@ -641,22 +683,26 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
                 if control is not None:
                     control_final = control.step()
                     control_tail.append(control_final)
-                row = welfare_history(final, tracker, control_final, control_tracker)
-                row.update(trust_tracker.observe(final.round))
-                writer.writerow(row)
+                record_round = history.should_write(final.round)
+                row = welfare_history(final, tracker, control_final, control_tracker,
+                                      include_row=record_round)
+                trust_values = trust_tracker.observe(final.round)
+                if record_round:
+                    row.update(trust_values)
+                    history.write(row)
                 tail.append(final)
                 for name in totals:
                     totals[name] += getattr(final, name)
                 metadata["completed_steps"] = final.round
                 if report_every and final.round % report_every == 0:
                     if not quiet:
-                        trust_progress = (f" | 资格者平均信任 {row['eligible_trust_mean']:.4f}"
-                                          if row["eligible_trust_mean"] is not None else "")
+                        trust_progress = (f" | 资格者平均信任 {trust_values['eligible_trust_mean']:.4f}"
+                                          if trust_values["eligible_trust_mean"] is not None else "")
                         print(f"步数 {final.round}/{steps} | 合作率 {final.cooperation_rate:.4f} "
                               f"| 平均收益 {final.average_payoff:.4f} "
                               f"{trust_progress} "
                               f"| 本次实验{format_progress_time(started, final.round, steps)}", flush=True)
-                    file.flush()
+                    history.flush()
         write_grid(output / "final_grid.csv", simulation.grid)
         if not tail:
             tail.append(initial)
@@ -665,6 +711,7 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
         summary = dict(
             asdict(config),
             lambda_prob=None if config.advice_mode == "adaptive" else config.lambda_prob,
+            trust_feedback_rule=config.trust_feedback_rule,
             parameter_set_id=parameter_set_id,
             repeat_index=repeat_index,
             repeats=repeats,
@@ -715,6 +762,7 @@ def run_single(config, steps, output, report_every, tail_average_steps, advisor=
             raise
         finally:
             if save_details:
+                metadata["history"].update(fields=history.fields, rows_written=history.rows_written)
                 write_json(config_path, metadata)
 
     if not quiet:
@@ -731,6 +779,8 @@ def run_batch(args, configs, scan_values, advisors):
     mode = "scan" if args.scan else "repeat"
     label = "扫描" if args.scan else "重复实验"
     save_details = not args.scan or args.scan_save_details
+    history_mode = args.scan_history_mode if args.scan else "full"
+    history_every = args.scan_history_every if args.scan else 1
     actual_workers = min(args.workers, len(configs))
     if args.scan:
         output = create_scan_output_directory(args.output_dir, SCAN_NAME)
@@ -740,6 +790,10 @@ def run_batch(args, configs, scan_values, advisors):
     metadata = {
         "mode": mode,
         "save_details": save_details,
+        "history_mode": history_mode,
+        "history_every": history_every,
+        "history_columns": list(COMPACT_HISTORY_FIELDS) if history_mode == "compact" else None,
+        "history_sampling_semantics": HISTORY_SAMPLING_SEMANTICS,
         "scan_values": scan_values,
         "repeats": args.repeats,
         "parameter_sets": len(configs) // args.repeats,
@@ -748,7 +802,8 @@ def run_batch(args, configs, scan_values, advisors):
                         else "base_seed_plus_repeat_index_minus_one"),
         "fixed_parameters": {
             name: getattr(configs[0], name)
-            for name in ("size", "initial_cooperation", "boundary", "update_mode", "trust_payoff_window")
+            for name in ("size", "initial_cooperation", "boundary", "update_mode",
+                         "trust_payoff_window", "trust_feedback_threshold")
         },
         "steps": args.steps,
         "advisor_batch": str(args.advisor_batch.resolve()),
@@ -758,6 +813,7 @@ def run_batch(args, configs, scan_values, advisors):
         "paired_fermi_control": args.paired_fermi_control,
         "control_lambda_prob": 0.0 if args.paired_fermi_control else None,
         "advice_mode": configs[0].advice_mode,
+        "trust_feedback_rule": configs[0].trust_feedback_rule,
         "control_advice_mode": "fixed" if args.paired_fermi_control else None,
         "statistics_semantics": STATISTICS_SEMANTICS,
         "summary_semantics": "one_row_per_run; tail_excludes_round_0_unless_steps_is_0; counters_are_totals",
@@ -782,15 +838,20 @@ def run_batch(args, configs, scan_values, advisors):
           "每个任务包含一次实验及其启用的配对对照。", flush=True)
     print(f"本批{format_progress_time(started, 0, len(configs))}；"
           "预计时间按整体完成速度估算，会随参数和运行速度变化。", flush=True)
+    if history_mode == "none":
+        print("本批关闭history.csv；完整汇总仍逐轮计算，保存至summary.csv。", flush=True)
+    else:
+        columns = "18列核心指标" if history_mode == "compact" else "全部52列"
+        print(f"历史记录：{columns}，每{history_every}轮一行，始终保存初态和成功末态。", flush=True)
     if not save_details:
-        print("扫描使用精简输出：每个子目录仅保存 history.csv 和 final_grid.csv。", flush=True)
+        print("扫描不保存附加配置/网格明细；每次保留最终策略网格及所选历史记录。", flush=True)
     if args.paired_fermi_control:
-        print("每次实验额外配对一条同初态纯Fermi对照轨迹，统计写入同一份 history.csv 和 summary.csv。", flush=True)
+        print("每次实验配对同初态纯Fermi对照；完整汇总写入summary.csv，轨迹按历史设置保存。", flush=True)
     fields = [
         "run_id", "parameter_set_id", "repeat_index", "repeats",
         "b", "k", "lambda_prob", "llm_access_fraction", "llm_access_count",
-        "advice_mode", "initial_trust", "trust_learning_rate", "aspiration_learning_rate",
-        "trust_payoff_window",
+        "advice_mode", "initial_trust", "trust_learning_rate", "trust_feedback_rule",
+        "trust_payoff_window", "trust_feedback_threshold",
         "actual_llm_access_fraction", "seed", "size", "boundary", "update_mode",
         "initial_cooperation", "steps", "initial_cooperation_rate", "final_cooperation_rate",
         "final_average_payoff", "tail_average_steps", "tail_start_round", "tail_end_round",
@@ -809,7 +870,7 @@ def run_batch(args, configs, scan_values, advisors):
         parameter_set_id = (run_id - 1) // args.repeats + 1
         repeat_index = (run_id - 1) % args.repeats + 1
         mechanism_name = (f"_adaptive_t{config.initial_trust}_alpha{config.trust_learning_rate}"
-                          f"_beta{config.aspiration_learning_rate}_w{config.trust_payoff_window}"
+                          f"_prior{config.trust_payoff_window}"
                           if config.advice_mode == "adaptive"
                           else f"_lambda{config.lambda_prob}")
         name = (f"run_{run_id:04d}_b{config.b}_k{config.k}"
@@ -822,6 +883,7 @@ def run_batch(args, configs, scan_values, advisors):
             repeat_index=repeat_index, repeats=args.repeats,
             save_details=save_details, paired_control=args.paired_fermi_control,
             early_average_steps=args.early_average_steps,
+            history_mode=history_mode, history_every=history_every,
         )))
 
     completed_rows = {}
@@ -841,7 +903,8 @@ def run_batch(args, configs, scan_values, advisors):
         metadata["completed_run_ids"] = sorted(completed_rows)
         write_json(config_path, metadata)
         mechanism = (f"adaptive, T0={summary['initial_trust']}, α={summary['trust_learning_rate']}, "
-                     f"β={summary['aspiration_learning_rate']}, W={summary['trust_payoff_window']}"
+                     f"历史W={summary['trust_payoff_window']}（不含本轮）, "
+                     f"阈值={summary['trust_feedback_threshold']}"
                      if summary["advice_mode"] == "adaptive"
                      else f"fixed, λ={summary['lambda_prob']}")
         trust_progress = (f" | 最终平均信任 {summary['final_eligible_trust_mean']:.4f}"
